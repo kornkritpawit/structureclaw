@@ -19,6 +19,7 @@ pattern from the YJK SDK.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import sys
@@ -414,13 +415,12 @@ def _prewarm_yjk_launcher(yjks_root: str, steps: list[dict]) -> bool:
     started_at = time.monotonic()
     cwd = _env_path("YJK_LAUNCHER_CWD") or yjks_root
     try:
+        proc = _popen_gui_detached([launcher], cwd)
+        pid = proc.pid
         if existing_pid <= 0:
-            proc = _popen_gui_detached([launcher], cwd)
-            pid = proc.pid
             message = "Started official YJK launcher and kept it alive for authorization."
         else:
-            pid = existing_pid
-            message = "Reused existing official YJK launcher for authorization."
+            message = "Reinvoked official YJK launcher to refresh authorization."
     except Exception as exc:
         _record_step(
             steps,
@@ -856,8 +856,18 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return default
 
 
-def _as_abs_max(current: float, value: object) -> float:
-    return max(abs(current), abs(_safe_float(value)))
+def _finite_result_float(value: object, label: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"YJK result {label} is not numeric") from error
+    if not math.isfinite(number):
+        raise RuntimeError(f"YJK result {label} is not finite")
+    return number
+
+
+def _signed_max_abs(current: float, candidate: float) -> float:
+    return candidate if abs(candidate) > abs(current) else current
 
 
 def _round_map(values: dict[str, float], digits: int = 4) -> dict[str, float]:
@@ -942,7 +952,8 @@ def _build_result_node_lookup(
                 "id",
             ):
                 for candidate in _id_candidates(item.get(field)):
-                    id_to_v2[candidate] = mapped_id
+                    existing = id_to_v2.get(candidate)
+                    id_to_v2[candidate] = mapped_id if existing in (None, mapped_id) else ""
             coord_keys: list[tuple[int, int, int]] = []
             if any(item.get(field) is not None for field in ("x_mm", "y_mm", "z_mm")):
                 coord_keys.append(_coord_key(item.get("x_mm"), item.get("y_mm"), item.get("z_mm")))
@@ -1125,48 +1136,56 @@ def _force_from_sections(sections: object) -> dict[str, float]:
     for row in rows:
         if not isinstance(row, (list, tuple)):
             continue
-        values = [_safe_float(item) for item in row]
-        while len(values) < 6:
-            values.append(0.0)
+        if len(row) < 6:
+            raise RuntimeError("YJK member-force section returned fewer than six local-force components")
+        values = [
+            _finite_result_float(item, f"member force[{index}]")
+            for index, item in enumerate(row[:6])
+        ]
         mx, my, qx, qy, axial, torsion = values[:6]
-        force["N"] = _as_abs_max(force["N"], axial)
-        force["Vy"] = _as_abs_max(force["Vy"], qx)
-        force["Vz"] = _as_abs_max(force["Vz"], qy)
-        force["T"] = _as_abs_max(force["T"], torsion)
-        force["My"] = _as_abs_max(force["My"], my)
-        force["Mz"] = _as_abs_max(force["Mz"], mx)
+        force["N"] = _signed_max_abs(force["N"], axial)
+        force["Vy"] = _signed_max_abs(force["Vy"], qx)
+        force["Vz"] = _signed_max_abs(force["Vz"], qy)
+        force["T"] = _signed_max_abs(force["T"], torsion)
+        force["My"] = _signed_max_abs(force["My"], my)
+        force["Mz"] = _signed_max_abs(force["Mz"], mx)
+        force["V"] = max(force.get("V", 0.0), math.hypot(qx, qy))
+        force["M"] = max(force.get("M", 0.0), math.hypot(my, mx))
 
-    force["V"] = (force["Vy"] ** 2 + force["Vz"] ** 2) ** 0.5
-    force["M"] = (force["My"] ** 2 + force["Mz"] ** 2) ** 0.5
+    force.setdefault("V", 0.0)
+    force.setdefault("M", 0.0)
     return force
 
 
 def _reaction_from_raw(raw: dict) -> dict[str, float]:
     reaction = {
-        "Fx": _safe_float(raw.get("Fx", raw.get("fx", raw.get("RX", raw.get("rx"))))),
-        "Fy": _safe_float(raw.get("Fy", raw.get("fy", raw.get("RY", raw.get("ry"))))),
-        "Fz": _safe_float(raw.get("Fz", raw.get("fz", raw.get("RZ", raw.get("rz"))))),
-        "Mx": _safe_float(raw.get("Mx", raw.get("mx"))),
-        "My": _safe_float(raw.get("My", raw.get("my"))),
-        "Mz": _safe_float(raw.get("Mz", raw.get("mz"))),
+        "fx": _finite_result_float(raw.get("Fx", raw.get("fx", raw.get("RX", raw.get("rx")))), "reaction fx"),
+        "fy": _finite_result_float(raw.get("Fy", raw.get("fy", raw.get("RY", raw.get("ry")))), "reaction fy"),
+        "fz": _finite_result_float(raw.get("Fz", raw.get("fz", raw.get("RZ", raw.get("rz")))), "reaction fz"),
+        "mx": _finite_result_float(raw.get("Mx", raw.get("mx")), "reaction mx"),
+        "my": _finite_result_float(raw.get("My", raw.get("my")), "reaction my"),
+        "mz": _finite_result_float(raw.get("Mz", raw.get("mz")), "reaction mz"),
     }
     reaction["R"] = _safe_float(
         raw.get("R"),
-        (reaction["Fx"] ** 2 + reaction["Fy"] ** 2 + reaction["Fz"] ** 2) ** 0.5,
+        (reaction["fx"] ** 2 + reaction["fy"] ** 2 + reaction["fz"] ** 2) ** 0.5,
     )
     return reaction
 
 
 def _merge_max_reaction(target: dict[str, float], candidate: dict[str, float]) -> dict[str, float]:
     merged = dict(target)
-    for key in ("Fx", "Fy", "Fz", "Mx", "My", "Mz", "R"):
-        merged[key] = max(abs(_safe_float(merged.get(key))), abs(_safe_float(candidate.get(key))))
+    for key in ("fx", "fy", "fz", "mx", "my", "mz"):
+        merged[key] = _signed_max_abs(_safe_float(merged.get(key)), _safe_float(candidate.get(key)))
+    merged["R"] = max(abs(_safe_float(merged.get("R"))), abs(_safe_float(candidate.get("R"))))
     return merged
 
 
 def _merge_max_force(target: dict[str, float], candidate: dict[str, float]) -> dict[str, float]:
     merged = dict(target)
-    for key in ("N", "Vy", "Vz", "T", "My", "Mz", "V", "M"):
+    for key in ("N", "Vy", "Vz", "T", "My", "Mz"):
+        merged[key] = _signed_max_abs(_safe_float(merged.get(key)), _safe_float(candidate.get(key)))
+    for key in ("V", "M"):
         merged[key] = max(abs(_safe_float(merged.get(key))), abs(_safe_float(candidate.get(key))))
     return merged
 
@@ -1184,7 +1203,7 @@ def _accumulate_node_envelope(
     ) ** 0.5
     item = table.setdefault(str(node_id), {"maxAbsDisplacement": 0.0, "controlCase": ""})
     if mag > _safe_float(item.get("maxAbsDisplacement")):
-        item["maxAbsDisplacement"] = round(mag, 4)
+        item["maxAbsDisplacement"] = round(mag, 8)
         item["controlCase"] = case_name
 
 
@@ -1230,12 +1249,12 @@ def _accumulate_reaction_envelope(
         {
             "maxAbsReaction": 0.0,
             "controlCase": "",
-            "Fx": 0.0,
-            "Fy": 0.0,
-            "Fz": 0.0,
-            "Mx": 0.0,
-            "My": 0.0,
-            "Mz": 0.0,
+            "fx": 0.0,
+            "fy": 0.0,
+            "fz": 0.0,
+            "mx": 0.0,
+            "my": 0.0,
+            "mz": 0.0,
             "R": 0.0,
         },
     )
@@ -1450,8 +1469,11 @@ def _build_yjk_design_results(
                 result_node_lookup=result_node_lookup,
                 diagnostics=diagnostics,
             )
-            if match_method != "raw":
-                mapped_count += 1
+            if match_method not in {"direct", "endpoint"}:
+                raise RuntimeError(
+                    f"YJK design result for {category} member '{raw_item.get('id')}' lacks an exact id or endpoint mapping"
+                )
+            mapped_count += 1
 
             metrics = raw_item.get("metrics", {})
             usage = _design_usage_by_check(category, metrics)
@@ -1525,6 +1547,18 @@ def _build_analysis_result(
         result_node_lookup=result_node_lookup,
         diagnostics=diagnostics,
     )
+    expected_nodes = {
+        str(item.get("v2_id") or node_id)
+        for node_id, item in mapping.get("nodes", {}).items()
+        if isinstance(item, dict)
+    } if isinstance(mapping.get("nodes"), dict) else set()
+    expected_elements = {
+        str(item.get("v2_id") or element_id)
+        for element_id, item in mapping.get("elements", {}).items()
+        if isinstance(item, dict)
+    } if isinstance(mapping.get("elements"), dict) else set()
+    if not mapping or not expected_nodes or not expected_elements:
+        raise RuntimeError("YJK result normalization requires a complete converter mapping")
 
     displacements: dict[str, dict[str, float]] = {}
     forces: dict[str, dict[str, float]] = {}
@@ -1567,14 +1601,11 @@ def _build_analysis_result(
                 displacement_rows_seen += 1
                 raw_node_id = str(raw_disp.get("id"))
                 node_id = result_node_lookup.get(raw_node_id, raw_node_id)
+                # YJK extracted translations are already expressed in metres.
                 disp = _round_map({
-                    "ux": _safe_float(raw_disp.get("ux")),
-                    "uy": _safe_float(raw_disp.get("uy")),
-                    "uz": _safe_float(raw_disp.get("uz")),
-                    "rx": _safe_float(raw_disp.get("rx")),
-                    "ry": _safe_float(raw_disp.get("ry")),
-                    "rz": _safe_float(raw_disp.get("rz")),
-                })
+                    axis: _finite_result_float(raw_disp.get(axis), f"node {raw_node_id} displacement {axis}")
+                    for axis in ("ux", "uy", "uz", "rx", "ry", "rz")
+                }, digits=8)
                 case_disps[node_id] = disp
                 _accumulate_node_envelope(node_displacement_envelope, node_id, case_name, disp)
 
@@ -1608,12 +1639,15 @@ def _build_analysis_result(
                     _safe_float(item.get("id"), 0.0),
                 ),
             ):
+                sections = raw_force.get("sections")
+                if not isinstance(sections, list) or not sections:
+                    continue
                 force_rows_seen += 1
                 category_member_lookup = member_definition_lookup.get(category, {})
                 raw_force = _merge_member_definition(category_member_lookup, raw_force)
                 floor = int(round(_safe_float(raw_force.get("floor"), 0.0)))
                 sequence_by_floor[floor] = sequence_by_floor.get(floor, 0) + 1
-                elem_id, _match_method = _member_id_for(
+                elem_id, match_method = _member_id_for(
                     category=category,
                     raw_member=raw_force,
                     sequence=sequence_by_floor[floor],
@@ -1621,7 +1655,11 @@ def _build_analysis_result(
                     result_node_lookup=result_node_lookup,
                     diagnostics=diagnostics,
                 )
-                force = _round_map(_force_from_sections(raw_force.get("sections")), digits=3)
+                if match_method not in {"direct", "endpoint"}:
+                    raise RuntimeError(
+                        f"YJK force result for {category} member '{raw_force.get('id')}' lacks an exact id or endpoint mapping"
+                    )
+                force = _round_map(_force_from_sections(sections), digits=3)
                 case_forces[elem_id] = _merge_max_force(case_forces.get(elem_id, {}), force)
                 forces[elem_id] = _merge_max_force(forces.get(elem_id, {}), force)
                 _accumulate_element_envelope(element_force_envelope, elem_id, case_name, force)
@@ -1640,6 +1678,15 @@ def _build_analysis_result(
                 reactions[node_id] = _merge_max_reaction(reactions.get(node_id, {}), reaction)
                 _accumulate_reaction_envelope(node_reaction_envelope, node_id, case_name, reaction)
 
+        for label, actual, expected in (
+            ("displacement nodes", set(case_disps), expected_nodes),
+            ("reaction nodes", set(case_reactions), expected_nodes),
+        ):
+            if actual != expected:
+                raise RuntimeError(
+                    f"YJK case '{case_name}' {label} do not exactly cover the converted model"
+                )
+
         case_results[case_name] = {
             "status": "success",
             "key": case_name,
@@ -1650,7 +1697,10 @@ def _build_analysis_result(
             "id": descriptor.get("id"),
             "oldId": descriptor.get("oldId"),
             "displacements": case_disps,
-            "forces": case_forces,
+            "forces": {
+                element_id: {**force, "referenceFrame": "element-local"}
+                for element_id, force in case_forces.items()
+            },
             "reactions": case_reactions,
             "envelope": {},
         }
@@ -1688,7 +1738,7 @@ def _build_analysis_result(
             control_reaction = node_id
 
     envelope = {
-        "maxAbsDisplacement": round(max_disp, 4),
+        "maxAbsDisplacement": round(max_disp, 8),
         "controlNodeDisplacement": max_disp_node,
         "maxAbsAxialForce": round(max_axial, 2),
         "maxAbsShearForce": round(max_shear, 2),
@@ -1700,11 +1750,26 @@ def _build_analysis_result(
         "controlNodeReaction": control_reaction or None,
     }
     if max_disp_node:
-        envelope[f"node:{max_disp_node}:maxAbsDisplacement"] = round(max_disp, 4)
+        envelope[f"node:{max_disp_node}:maxAbsDisplacement"] = round(max_disp, 8)
+
+    if force_rows_seen == 0 or displacement_rows_seen == 0 or reaction_rows_seen == 0:
+        raise RuntimeError("YJK result extraction did not return complete force, displacement, and reaction rows")
+    if diagnostics.get("node_unmapped", 0) > 0 or diagnostics.get("element_unmapped", 0) > 0:
+        raise RuntimeError("YJK result extraction contains node or member rows that cannot be mapped exactly")
+    for label, actual, expected in (
+        ("displacement nodes", set(displacements), expected_nodes),
+        ("reaction nodes", set(reactions), expected_nodes),
+        ("force elements", set(forces), expected_elements),
+    ):
+        if actual != expected:
+            missing = sorted(expected - actual)
+            unexpected = sorted(actual - expected)
+            raise RuntimeError(
+                f"YJK {label} do not exactly cover the converted model "
+                f"(missing={missing[:5]}, unexpected={unexpected[:5]})"
+            )
 
     warnings: list[str] = []
-    if not mapping:
-        warnings.append("YJK mapping.json was not found; raw YJK ids were used for result keys.")
     members = extracted.get("members", {})
     if not isinstance(members, dict) or all(not members.get(category) for category in ("columns", "beams", "braces")):
         warnings.append("YJK raw members were empty; element result mapping used force rows and fallbacks.")
@@ -1740,8 +1805,11 @@ def _build_analysis_result(
     return {
         "status": "success",
         "analysisMode": "yjk-static",
-        "displacements": {key: _round_map(value) for key, value in displacements.items()},
-        "forces": {key: _round_map(value, digits=3) for key, value in forces.items()},
+        "displacements": {key: _round_map(value, digits=8) for key, value in displacements.items()},
+        "forces": {
+            key: {**_round_map(value, digits=3), "referenceFrame": "element-local"}
+            for key, value in forces.items()
+        },
         "reactions": {key: _round_map(value, digits=3) for key, value in reactions.items()},
         "envelope": envelope,
         "summary": {
@@ -1757,7 +1825,7 @@ def _build_analysis_result(
             "designElementCount": design_results["summary"]["elementCount"],
             "maxDesignUtilization": design_results["summary"]["maxUtilization"],
             "controllingDesignElement": design_results["summary"]["controllingElement"],
-            "maxDisplacement": round(max_disp, 4),
+            "maxDisplacement": round(max_disp, 8),
             "maxDisplacementNode": max_disp_node,
             "floors_analyzed": meta.get("n_floors"),
             "n_floors": meta.get("n_floors"),
@@ -2232,12 +2300,6 @@ def _run(model_path: str, work_dir: str, yjks_root: str) -> int:
                     phase="analysis_async",
                     steps=background_steps,
                 )
-                _run_cmd(
-                    "SetCurrentLabel",
-                    "IDDSN_DSP",
-                    phase="analysis_async",
-                    steps=background_steps,
-                )
                 print("[yjk_driver] background calculation finished", file=sys.stderr, flush=True)
             except Exception as exc:
                 print(f"[yjk_driver] background calculation error: {exc}", file=sys.stderr, flush=True)
@@ -2285,15 +2347,6 @@ def _run(model_path: str, work_dir: str, yjks_root: str) -> int:
             "YJK crashed or failed during design calculation",
             phase="analysis",
             command="yjkdesign_dsncalculating_all",
-            steps=steps,
-            summary={"work_dir": work_dir, "yjk_project": yjk_project},
-        )
-        return 1
-    if not _run_cmd("SetCurrentLabel", "IDDSN_DSP", phase="analysis", steps=steps):
-        _error(
-            "YJK crashed while switching to design result label",
-            phase="analysis",
-            command="SetCurrentLabel",
             steps=steps,
             summary={"work_dir": work_dir, "yjk_project": yjk_project},
         )

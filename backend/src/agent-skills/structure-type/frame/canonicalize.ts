@@ -1,4 +1,5 @@
 import { mergeDraftPatchWithSupplemental } from '../../../agent-runtime/legacy.js';
+import { isLocalizedFramePointLoad } from '../../../agent-runtime/engineering-draft.js';
 import type { DraftExtraction, DraftFloorLoad, EngineeringDraftLoad } from '../../../agent-runtime/types.js';
 import type { FramePatchSources } from './types.js';
 
@@ -21,6 +22,44 @@ export function stripDeadFloorLoadValues(floorLoads: DraftFloorLoad[] | undefine
     if (load.lateralXKN !== undefined) next.lateralXKN = load.lateralXKN;
     if (load.lateralYKN !== undefined) next.lateralYKN = load.lateralYKN;
     preservedLoads.push(next);
+  }
+  return preservedLoads.length ? preservedLoads : undefined;
+}
+
+function stripDuplicatedLocalizedNodalLoads(
+  floorLoads: DraftFloorLoad[] | undefined,
+  engineeringLoads: EngineeringDraftLoad[] | undefined,
+): DraftFloorLoad[] | undefined {
+  const localizedDirections = new Map<number, Set<'x' | 'y' | 'z'>>();
+  for (const load of engineeringLoads ?? []) {
+    if (!isLocalizedFramePointLoad(load)) continue;
+    const story = load.location?.story;
+    if (!Number.isInteger(story)) continue;
+    const direction = load.direction === 'globalX'
+      ? 'x'
+      : load.direction === 'globalY'
+        ? 'y'
+        : load.direction === 'gravity' || load.direction === 'globalZ' || load.direction === undefined
+          ? 'z'
+          : undefined;
+    if (!direction) continue;
+    const storyDirections = localizedDirections.get(story!) ?? new Set<'x' | 'y' | 'z'>();
+    storyDirections.add(direction);
+    localizedDirections.set(story!, storyDirections);
+  }
+
+  const preservedLoads: DraftFloorLoad[] = [];
+  for (const load of floorLoads ?? []) {
+    const directions = localizedDirections.get(load.story);
+    const next: DraftFloorLoad = { story: load.story };
+    if (load.verticalKN !== undefined && !directions?.has('z')) next.verticalKN = load.verticalKN;
+    if (load.liveLoadKN !== undefined) next.liveLoadKN = load.liveLoadKN;
+    if (load.lateralXKN !== undefined && !directions?.has('x')) next.lateralXKN = load.lateralXKN;
+    if (load.lateralYKN !== undefined && !directions?.has('y')) next.lateralYKN = load.lateralYKN;
+    if (next.verticalKN !== undefined
+      || next.liveLoadKN !== undefined
+      || next.lateralXKN !== undefined
+      || next.lateralYKN !== undefined) preservedLoads.push(next);
   }
   return preservedLoads.length ? preservedLoads : undefined;
 }
@@ -124,12 +163,18 @@ export function canonicalizeFramePatch(input: FramePatchSources): DraftExtractio
   };
 
   const shouldStripGravityFloorLoads = hasSemanticGravityLineLoads(mergedPatch);
+  const incomingFloorLoads = stripDuplicatedLocalizedNodalLoads(
+    shouldStripGravityFloorLoads ? stripDeadFloorLoadValues(mergedPatch.floorLoads) : mergedPatch.floorLoads,
+    mergedPatch.engineeringDraft?.loads,
+  );
   const floorLoads = mergeFloorLoadsByStory(
     input.existingState?.floorLoads,
-    shouldStripGravityFloorLoads ? stripDeadFloorLoadValues(mergedPatch.floorLoads) : mergedPatch.floorLoads,
+    incomingFloorLoads,
   );
   if (floorLoads) {
     next.floorLoads = floorLoads;
+  } else {
+    delete next.floorLoads;
   }
 
   next.frameDimension = resolveFrameDimension(next, input.existingState, floorLoads);

@@ -1,5 +1,9 @@
 import {
+  FIXED_RESTRAINT,
+  PINNED_RESTRAINT,
+  ROLLER_X_RESTRAINT,
   STRUCTURAL_COORDINATE_SEMANTICS,
+  withCanonicalCoordinateContract,
 } from './coordinate-semantics.js';
 import { buildElementReferenceVectors } from './reference-vectors.js';
 import type {
@@ -7,14 +11,15 @@ import type {
   DraftLoadType,
   DraftState,
   DraftSupportType,
+  EngineeringDraftLoad,
   FrameBaseSupportType,
 } from './types.js';
 
 function buildFixedRestraint(baseSupport: FrameBaseSupportType): boolean[] {
   if (baseSupport === 'pinned') {
-    return [true, true, true, false, false, false];
+    return [...PINNED_RESTRAINT];
   }
-  return [true, true, true, true, true, true];
+  return [...FIXED_RESTRAINT];
 }
 
 function accumulateCoordinates(lengths: number[]): number[] {
@@ -107,7 +112,6 @@ function buildFrame2dModel(state: DraftState, metadata: Record<string, unknown>)
       }
     }
   }
-
   return {
     schema_version: '2.0.0',
     unit_system: 'SI',
@@ -267,9 +271,9 @@ function buildFrame3dModel(state: DraftState, metadata: Record<string, unknown>)
 }
 
 function buildBeamNodes(length: number, supportType: DraftSupportType, loadPositionM?: number) {
-  const fixedRestraint = [true, true, true, true, true, true] as const;
-  const pinnedRestraint = [true, true, true, true, true, false] as const;
-  const rollerRestraint = [false, true, true, true, true, false] as const;
+  const fixedRestraint = FIXED_RESTRAINT;
+  const pinnedRestraint = PINNED_RESTRAINT;
+  const rollerRestraint = ROLLER_X_RESTRAINT;
   let leftRestraint: boolean[] = [...fixedRestraint];
   let rightRestraint: boolean[] | undefined;
 
@@ -304,8 +308,8 @@ function buildBeamNodes(length: number, supportType: DraftSupportType, loadPosit
 }
 
 function buildOverhangingBeamNodes(simpleSpan: number, overhangLength: number) {
-  const pinnedRestraint = [true, true, true, true, true, false] as const;
-  const rollerRestraint = [false, true, true, true, true, false] as const;
+  const pinnedRestraint = PINNED_RESTRAINT;
+  const rollerRestraint = ROLLER_X_RESTRAINT;
   const totalLength = simpleSpan + overhangLength;
 
   return {
@@ -364,6 +368,139 @@ function buildTrussTopElevation(topology: string, x: number, span: number, heigh
   return height;
 }
 
+function buildExplicitTrussTopology(state: DraftState): {
+  nodes: Array<Record<string, unknown>>;
+  elements: Array<Record<string, unknown>>;
+} | null {
+  const topology = state.engineeringDraft?.topology;
+  if (!topology?.nodes?.length || !topology.members?.length) return null;
+  const nodeIds = new Set(topology.nodes.map((node) => node.id));
+  if (nodeIds.size !== topology.nodes.length
+    || topology.members.some((member) => !nodeIds.has(member.nodes[0]) || !nodeIds.has(member.nodes[1]))) {
+    return null;
+  }
+
+  const nodes = topology.nodes.map((node) => ({
+    id: node.id,
+    x: node.x,
+    y: node.y,
+    z: node.z,
+    ...(node.restraints
+      ? {
+          restraints: node.restraints[0] || node.restraints[2]
+            ? [
+                node.restraints[0],
+                true,
+                node.restraints[2],
+                node.restraints[3],
+                node.restraints[4],
+                node.restraints[5],
+              ]
+            : [...node.restraints],
+        }
+      : {}),
+  }));
+  if (!nodes.some((node) => 'restraints' in node)) {
+    const minZ = Math.min(...topology.nodes.map((node) => node.z));
+    const baseNodes = topology.nodes
+      .filter((node) => Math.abs(node.z - minZ) <= 1e-9)
+      .sort((left, right) => left.x - right.x || left.y - right.y);
+    const left = nodes.find((node) => node.id === baseNodes[0]?.id);
+    const right = nodes.find((node) => node.id === baseNodes[baseNodes.length - 1]?.id);
+    if (left) left.restraints = [...PINNED_RESTRAINT];
+    if (right && right !== left) right.restraints = [...ROLLER_X_RESTRAINT];
+  }
+
+  return {
+    nodes,
+    elements: topology.members.map((member, index) => ({
+      id: member.id ?? `E${index + 1}`,
+      type: 'truss',
+      nodes: [...member.nodes],
+      material: '1',
+      section: '1',
+    })),
+  };
+}
+
+function buildExplicitTrussLoads(
+  state: DraftState,
+  nodes: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const nodeIds = new Set(nodes.map((node) => String(node.id)));
+  const coordinates = nodes.filter((node): node is Record<string, unknown> & {
+    id: string;
+    x: number;
+    z: number;
+  } => (
+    typeof node.id === 'string'
+    && typeof node.x === 'number'
+    && typeof node.z === 'number'
+  ));
+  const minX = Math.min(...coordinates.map((node) => Number(node.x)));
+  const maxX = Math.max(...coordinates.map((node) => Number(node.x)));
+  const minZ = Math.min(...coordinates.map((node) => Number(node.z)));
+
+  function semanticTargetIds(load: EngineeringDraftLoad): string[] {
+    const role = `${load.location?.nodeRole ?? ''} ${load.target ?? ''}`.trim().toLowerCase();
+    const chord = role.includes('top') || role.includes('upper') || role.includes('上弦')
+      ? 'top'
+      : role.includes('bottom') || role.includes('lower') || role.includes('下弦')
+        ? 'bottom'
+        : undefined;
+    const locationX = load.location?.xM;
+    if (typeof locationX === 'number' && Number.isFinite(locationX)) {
+      const nodesAtLocation = coordinates.filter(
+        (node) => Math.abs(Number(node.x) - locationX) <= 1e-9,
+      );
+      const locatedTargets = chord
+        ? nodesAtLocation.filter((node) => (
+            chord === 'top'
+              ? Number(node.z) > minZ + 1e-9
+              : Math.abs(Number(node.z) - minZ) <= 1e-9
+          ))
+        : nodesAtLocation.length === 1
+          ? nodesAtLocation
+          : [];
+      if (locatedTargets.length > 0) {
+        return locatedTargets
+          .sort((left, right) => (
+            Number(left.z) - Number(right.z)
+            || Number(left.x) - Number(right.x)
+            || String(left.id).localeCompare(String(right.id))
+          ))
+          .map((node) => String(node.id));
+      }
+    }
+    if (!chord) return [];
+
+    return coordinates
+      .filter((node) => (
+        Number(node.x) > minX + 1e-9
+        && Number(node.x) < maxX - 1e-9
+        && (chord === 'top'
+          ? Number(node.z) > minZ + 1e-9
+          : Math.abs(Number(node.z) - minZ) <= 1e-9)
+      ))
+      .sort((left, right) => (
+        Number(left.x) - Number(right.x)
+        || Number(left.z) - Number(right.z)
+        || String(left.id).localeCompare(String(right.id))
+      ))
+      .map((node) => String(node.id));
+  }
+
+  return (state.engineeringDraft?.loads ?? []).flatMap((load) => {
+    const target = load.target?.trim();
+    if (load.kind !== 'point' && load.kind !== 'nodal') return [];
+    const targets = target && nodeIds.has(target) ? [target] : semanticTargetIds(load);
+    if (targets.length === 0) return [];
+    const component = load.direction === 'globalX' ? 'fx' : load.direction === 'globalY' ? 'fy' : 'fz';
+    const sign = component === 'fz' ? -1 : 1;
+    return targets.map((node) => ({ node, [component]: sign * load.magnitude }));
+  });
+}
+
 function buildTrussModel(state: DraftState, metadata: Record<string, unknown>): Record<string, unknown> {
   const span = state.lengthM!;
   const panelCount = clampTrussPanelCount(state.bayCount, span);
@@ -371,12 +508,13 @@ function buildTrussModel(state: DraftState, metadata: Record<string, unknown>): 
   const load = state.loadKN!;
   const topology = getTrussTopology(state);
   const panelLength = span / panelCount;
-  const fixed = [true, true, true, true, true, true];
-  const roller = [false, true, true, true, true, true];
-  const nodes: Array<Record<string, unknown>> = [];
-  const elements: Array<Record<string, unknown>> = [];
+  const fixed = [...PINNED_RESTRAINT];
+  const roller = [...ROLLER_X_RESTRAINT];
+  const explicitTopology = buildExplicitTrussTopology(state);
+  const nodes: Array<Record<string, unknown>> = explicitTopology?.nodes ?? [];
+  const elements: Array<Record<string, unknown>> = explicitTopology?.elements ?? [];
 
-  for (let i = 0; i <= panelCount; i += 1) {
+  for (let i = 0; !explicitTopology && i <= panelCount; i += 1) {
     const node: Record<string, unknown> = {
       id: `B${i}`,
       x: i * panelLength,
@@ -391,7 +529,7 @@ function buildTrussModel(state: DraftState, metadata: Record<string, unknown>): 
     nodes.push(node);
   }
 
-  for (let i = 0; i <= panelCount; i += 1) {
+  for (let i = 0; !explicitTopology && i <= panelCount; i += 1) {
     const x = i * panelLength;
     nodes.push({
       id: `T${i}`,
@@ -401,7 +539,7 @@ function buildTrussModel(state: DraftState, metadata: Record<string, unknown>): 
     });
   }
 
-  for (let i = 0; i < panelCount; i += 1) {
+  for (let i = 0; !explicitTopology && i < panelCount; i += 1) {
     elements.push({
       id: `BC${i}`,
       type: 'truss',
@@ -418,7 +556,7 @@ function buildTrussModel(state: DraftState, metadata: Record<string, unknown>): 
     });
   }
 
-  for (let i = 0; i <= panelCount; i += 1) {
+  for (let i = 0; !explicitTopology && i <= panelCount; i += 1) {
     elements.push({
       id: `WV${i}`,
       type: 'truss',
@@ -445,7 +583,10 @@ function buildTrussModel(state: DraftState, metadata: Record<string, unknown>): 
   const loadNodeIndexes = state.loadPosition === 'middle-joint'
     ? [Math.max(1, Math.min(panelCount - 1, Math.round(panelCount / 2)))]
     : Array.from({ length: Math.max(0, panelCount - 1) }, (_, index) => index + 1);
-  const nodalLoads = loadNodeIndexes.map((index) => ({ node: `${loadPrefix}${index}`, fz: -load }));
+  const explicitLoads = buildExplicitTrussLoads(state, nodes);
+  const nodalLoads = explicitLoads.length > 0
+    ? explicitLoads
+    : loadNodeIndexes.map((index) => ({ node: `${loadPrefix}${index}`, fz: -load }));
 
   return {
     schema_version: '2.0.0',
@@ -465,6 +606,7 @@ function buildTrussModel(state: DraftState, metadata: Record<string, unknown>): 
     metadata: {
       ...metadata,
       trussTopology: topology,
+      topologySource: explicitTopology ? 'engineering-draft' : 'generated',
       loadChord,
       panelCount,
       panelCountDefaulted: state.bayCount === undefined,
@@ -480,6 +622,10 @@ function buildTrussModel(state: DraftState, metadata: Record<string, unknown>): 
 
 function readPositiveNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function readNonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 function readFiniteNumber(value: unknown): number | undefined {
@@ -679,9 +825,15 @@ function semanticPointLoadX(load: Record<string, unknown>, state: DraftState, le
   const location = load.location && typeof load.location === 'object' && !Array.isArray(load.location)
     ? load.location as Record<string, unknown>
     : undefined;
-  const explicitX = readPositiveNumber(load.xM) ?? readPositiveNumber(location?.xM);
+  const explicitX = readNonNegativeNumber(load.xM) ?? readNonNegativeNumber(location?.xM);
   if (explicitX !== undefined) return explicitX;
   const target = typeof load.target === 'string' ? load.target.toLowerCase() : '';
+  const topologyNode = state.engineeringDraft?.topology?.nodes?.find(
+    (node) => node.id.trim().toLowerCase() === target.trim(),
+  );
+  if (topologyNode && topologyNode.x >= 0 && topologyNode.x <= length) {
+    return topologyNode.x;
+  }
   if (target.includes('end') || target.includes('free') || target.includes('端')) return length;
   return state.loadPositionM ?? length / 2;
 }
@@ -701,10 +853,79 @@ function beamSupportCoordinates(state: DraftState, supportType: DraftSupportType
   return [0, length];
 }
 
+function semanticDistributedLoadElements(
+  load: Record<string, unknown>,
+  elements: Array<Record<string, unknown>>,
+  coordinates: number[],
+  spanLengths: number[] | undefined,
+  state: DraftState,
+): Array<Record<string, unknown>> {
+  const location = load.location && typeof load.location === 'object' && !Array.isArray(load.location)
+    ? load.location as Record<string, unknown>
+    : undefined;
+  const spanIndex = readFiniteNumber(location?.spanIndex ?? load.spanIndex);
+  if (spanIndex !== undefined && spanLengths?.length) {
+    if (!Number.isInteger(spanIndex) || spanIndex < 1) return [];
+    const boundaries = accumulateCoordinates(spanLengths);
+    if (spanIndex >= boundaries.length) return [];
+    const start = boundaries[spanIndex - 1];
+    const end = boundaries[spanIndex];
+    return elements.filter((_element, index) => {
+      const midpoint = (coordinates[index] + coordinates[index + 1]) / 2;
+      return midpoint >= start - 1e-9 && midpoint <= end + 1e-9;
+    });
+  }
+
+  let candidates = elements;
+  let targetResolved = false;
+  const target = typeof load.target === 'string' ? load.target.trim().toLowerCase() : '';
+  if (target && !['beam', 'full-span', 'all'].includes(target)) {
+    const directMatches = elements.filter(
+      (element) => String(element.id ?? '').trim().toLowerCase() === target,
+    );
+    const topologyMember = state.engineeringDraft?.topology?.members?.find(
+      (member) => member.id?.trim().toLowerCase() === target,
+    );
+    if (directMatches.length > 0) {
+      candidates = directMatches;
+      targetResolved = true;
+    } else if (topologyMember) {
+      const topologyNodes = new Map(
+        (state.engineeringDraft?.topology?.nodes ?? []).map((node) => [node.id, node]),
+      );
+      const endpoints = topologyMember.nodes.map((nodeId) => topologyNodes.get(nodeId));
+      if (endpoints.every((node) => node !== undefined)) {
+        const start = Math.min(endpoints[0]!.x, endpoints[1]!.x);
+        const end = Math.max(endpoints[0]!.x, endpoints[1]!.x);
+        candidates = elements.filter((_element, index) => {
+          const midpoint = (coordinates[index] + coordinates[index + 1]) / 2;
+          return midpoint >= start - 1e-9 && midpoint <= end + 1e-9;
+        });
+        targetResolved = candidates.length > 0;
+      }
+    }
+  }
+
+  if (targetResolved) return candidates;
+  if (spanIndex === undefined) return candidates;
+  if (!Number.isInteger(spanIndex) || spanIndex < 1) return [];
+  const boundaries = spanLengths?.length
+    ? accumulateCoordinates(spanLengths)
+    : [0, coordinates[coordinates.length - 1]];
+  if (spanIndex >= boundaries.length) return [];
+  const start = boundaries[spanIndex - 1];
+  const end = boundaries[spanIndex];
+  return candidates.filter((element) => {
+    const index = elements.indexOf(element);
+    const midpoint = (coordinates[index] + coordinates[index + 1]) / 2;
+    return midpoint >= start - 1e-9 && midpoint <= end + 1e-9;
+  });
+}
+
 function beamSupportRestraint(supportType: DraftSupportType, supportIndex: number): boolean[] | undefined {
-  const fixed = [true, true, true, true, true, true];
-  const pinned = [true, true, true, true, true, false];
-  const roller = [false, true, true, true, true, false];
+  const fixed = [...FIXED_RESTRAINT];
+  const pinned = [...PINNED_RESTRAINT];
+  const roller = [...ROLLER_X_RESTRAINT];
 
   if (supportType === 'cantilever') {
     return supportIndex === 0 ? fixed : undefined;
@@ -778,7 +999,7 @@ function buildSemanticBeamModel(
     const magnitude = readPositiveNumber(load.magnitude);
     if (magnitude === undefined) continue;
     if (isSemanticDistributedLoad(load)) {
-      for (const element of elements) {
+      for (const element of semanticDistributedLoadElements(load, elements, coordinates, spanLengths, state)) {
         loads.push({ type: 'distributed', element: element.id, wz: -magnitude, wy: 0 });
       }
       continue;
@@ -817,17 +1038,128 @@ function buildSemanticBeamModel(
   };
 }
 
+const COLUMN_CONCRETE_MATERIALS: Record<string, { E: number; G: number; fc: number }> = {
+  C20: { E: 25500, G: 10625, fc: 9.6 },
+  C25: { E: 28000, G: 11667, fc: 11.9 },
+  C30: { E: 30000, G: 12500, fc: 14.3 },
+  C35: { E: 31500, G: 13125, fc: 16.7 },
+  C40: { E: 32500, G: 13542, fc: 19.1 },
+  C45: { E: 33500, G: 13958, fc: 21.1 },
+  C50: { E: 34500, G: 14375, fc: 23.1 },
+  C55: { E: 35500, G: 14792, fc: 25.3 },
+  C60: { E: 36000, G: 15000, fc: 27.5 },
+};
+
+const COLUMN_STEEL_SECTIONS: Record<string, {
+  name: string;
+  standardSteelName: string;
+  shape: { kind: 'H'; H: number; B: number; tw: number; tf: number };
+  properties: { A: number; Iy: number; Iz: number; J: number; G: number };
+}> = {
+  HW300X300: {
+    name: 'HW300x300',
+    standardSteelName: 'HW300x300',
+    shape: { kind: 'H', H: 300, B: 300, tw: 10, tf: 15 },
+    properties: { A: 0.01192, Iy: 2.04e-4, Iz: 6.75e-5, J: 4.23e-6, G: 79000 },
+  },
+};
+
+function solidRectangularTorsionConstant(width: number, depth: number): number {
+  const a = Math.max(width, depth);
+  const b = Math.min(width, depth);
+  const aspect = b / a;
+  return a * b ** 3 * (1 / 3 - 0.21 * aspect * (1 - b ** 4 / (12 * a ** 4)));
+}
+
+function buildColumnMaterial(
+  state: DraftState,
+  materialFamily: 'concrete' | 'steel',
+): { record: Record<string, unknown>; G: number } {
+  if (materialFamily === 'steel') {
+    return buildPortalFrameMaterial(state);
+  }
+  const requestedGrade = state.engineeringDraft?.material?.grade?.trim().toUpperCase() || 'C30';
+  const grade = COLUMN_CONCRETE_MATERIALS[requestedGrade] ? requestedGrade : 'C30';
+  const properties = COLUMN_CONCRETE_MATERIALS[grade];
+  return {
+    record: {
+      id: '1',
+      name: grade,
+      grade,
+      category: 'concrete',
+      E: properties.E,
+      nu: 0.2,
+      rho: 2500,
+      fc: properties.fc,
+    },
+    G: properties.G,
+  };
+}
+
+function buildColumnSection(
+  state: DraftState,
+  materialFamily: 'concrete' | 'steel',
+  materialName: string,
+  G: number,
+  sectionWidthM: number,
+  sectionDepthM: number,
+): Record<string, unknown> {
+  if (materialFamily === 'concrete') {
+    const width = sectionWidthM * 1000;
+    const height = sectionDepthM * 1000;
+    return {
+      id: '1',
+      name: `${materialName} ${width}x${height}`,
+      type: 'rect',
+      purpose: 'column',
+      width,
+      height,
+      shape: { kind: 'rectangular', B: width, H: height },
+      properties: {
+        A: sectionWidthM * sectionDepthM,
+        Iy: sectionWidthM * sectionDepthM ** 3 / 12,
+        Iz: sectionDepthM * sectionWidthM ** 3 / 12,
+        J: solidRectangularTorsionConstant(sectionWidthM, sectionDepthM),
+        G,
+      },
+    };
+  }
+
+  const raw = state.engineeringDraft?.sections?.column
+    ?? state.engineeringDraft?.sections?.member
+    ?? state.engineeringDraft?.sections?.beam;
+  const normalized = raw?.trim().toUpperCase().replace(/[×*]/g, 'X').replace(/\s+/g, '');
+  const catalogKey = normalized === 'H300X300' ? 'HW300X300' : normalized;
+  const catalog = catalogKey ? COLUMN_STEEL_SECTIONS[catalogKey] : undefined;
+  if (catalog) {
+    return {
+      id: '1',
+      name: catalog.name,
+      type: 'H',
+      purpose: 'column',
+      standard_steel_name: catalog.standardSteelName,
+      shape: catalog.shape,
+      properties: catalog.properties,
+    };
+  }
+  return { ...buildPortalFrameSection(state, G), purpose: 'column' };
+}
+
 function buildColumnModel(state: DraftState, metadata: Record<string, unknown>): Record<string, unknown> {
   const height = state.heightM ?? state.lengthM!;
   const axialLoad = state.loadKN!;
   const materialFamily = state.skillState?.materialFamily === 'concrete' ? 'concrete' : 'steel';
   const sectionWidthM = readPositiveNumber(state.skillState?.sectionWidthM) ?? 0.4;
   const sectionDepthM = readPositiveNumber(state.skillState?.sectionDepthM) ?? sectionWidthM;
-  const area = sectionWidthM * sectionDepthM;
-  const iy = (sectionWidthM * (sectionDepthM ** 3)) / 12;
-  const iz = (sectionDepthM * (sectionWidthM ** 3)) / 12;
-  const elasticModulus = materialFamily === 'concrete' ? 30000 : 205000;
-  const shearModulus = materialFamily === 'concrete' ? 12500 : 79000;
+  const material = buildColumnMaterial(state, materialFamily);
+  const section = buildColumnSection(
+    state,
+    materialFamily,
+    String(material.record.name),
+    material.G,
+    sectionWidthM,
+    sectionDepthM,
+  );
   const semanticColumnLoads = readRecordArray(state.skillState?.columnLoads);
   const modelLoads = semanticColumnLoads?.map((load) => {
     const fx = readFiniteNumber(load.fxKN);
@@ -850,14 +1182,10 @@ function buildColumnModel(state: DraftState, metadata: Record<string, unknown>):
       { id: '2', x: 0, y: 0, z: height },
     ],
     elements: [
-      { id: '1', type: 'beam', nodes: ['1', '2'], material: '1', section: '1' },
+      { id: '1', type: 'column', nodes: ['1', '2'], material: '1', section: '1' },
     ],
-    materials: [
-      { id: '1', name: materialFamily, E: elasticModulus, nu: 0.2, rho: materialFamily === 'concrete' ? 2500 : 7850 },
-    ],
-    sections: [
-      { id: '1', name: 'COLUMN', type: 'beam', properties: { A: area, Iy: iy, Iz: iz, J: Math.max(iy, iz), G: shearModulus } },
-    ],
+    materials: [material.record],
+    sections: [section],
     load_cases: [
       { id: 'LC1', type: 'other', loads },
     ],
@@ -886,7 +1214,21 @@ function getContinuousBeamSpanLengths(state: DraftState): number[] {
 
 function buildContinuousBeamModel(state: DraftState, metadata: Record<string, unknown>): Record<string, unknown> {
   const spans = getContinuousBeamSpanLengths(state);
-  const supportCoordinates = accumulateCoordinates(spans);
+  const totalLength = spans.reduce((sum, span) => sum + span, 0);
+  const topologyNodes = state.engineeringDraft?.topology?.nodes ?? [];
+  const boundarySupports = readNonNegativeNumberArray(state.engineeringDraft?.boundary?.supportPositionsM)
+    ?.filter((x) => x <= totalLength);
+  const topologySupports = topologyNodes
+    .filter((node) => Array.isArray(node.restraints) && node.restraints.some(Boolean))
+    .map((node) => node.x)
+    .filter((x) => x >= 0 && x <= totalLength);
+  const supportCoordinates = Array.from(new Set(
+    boundarySupports?.length
+      ? boundarySupports
+      : topologySupports.length
+        ? topologySupports
+        : accumulateCoordinates(spans),
+  )).sort((left, right) => left - right);
   const explicitPointLoad = readPositiveNumber(state.skillState?.pointLoadKN);
   const pointLoad = explicitPointLoad
     ?? (state.loadType === 'point' || state.loadType === undefined ? state.loadKN : undefined);
@@ -897,10 +1239,22 @@ function buildContinuousBeamModel(state: DraftState, metadata: Record<string, un
       (readPositiveInteger(state.skillState?.pointLoadSpanIndex) ?? (spans.indexOf(Math.max(...spans)) + 1)) - 1,
     ),
   );
-  const explicitPointLoadX = readPositiveNumber(state.skillState?.pointLoadXM);
+  const semanticPointLoad = state.engineeringDraft?.loads?.find(
+    (load) => load.kind === 'point' || load.kind === 'nodal',
+  );
+  const semanticPointTarget = semanticPointLoad?.target?.trim().toLowerCase();
+  const semanticPointHasExplicitCoordinate = semanticPointLoad?.location?.xM !== undefined
+    || (semanticPointTarget !== undefined && topologyNodes.some(
+      (node) => node.id.trim().toLowerCase() === semanticPointTarget,
+    ));
+  const explicitPointLoadX = readNonNegativeNumber(state.skillState?.pointLoadXM)
+    ?? (semanticPointLoad && semanticPointHasExplicitCoordinate
+      ? semanticPointLoadX(semanticPointLoad as unknown as Record<string, unknown>, state, totalLength)
+      : undefined);
   const middleSupportX = supportCoordinates.length > 2
     ? supportCoordinates[Math.floor((supportCoordinates.length - 1) / 2)]
     : undefined;
+  const spanBoundaries = accumulateCoordinates(spans);
   const pointLoadX = pointLoad !== undefined
     ? (
         explicitPointLoadX
@@ -909,20 +1263,24 @@ function buildContinuousBeamModel(state: DraftState, metadata: Record<string, un
           && (state.loadPosition === undefined || state.loadPosition === 'middle-joint')
           && middleSupportX !== undefined
             ? middleSupportX
-            : supportCoordinates[pointSpanIndex] + spans[pointSpanIndex] / 2
+            : spanBoundaries[pointSpanIndex] + spans[pointSpanIndex] / 2
         )
       )
     : undefined;
   const coordinates = Array.from(new Set([
     ...supportCoordinates,
+    ...topologyNodes.map((node) => node.x).filter((x) => x >= 0 && x <= totalLength),
     ...(pointLoadX !== undefined ? [pointLoadX] : []),
   ])).sort((left, right) => left - right);
-  const pinned = [true, true, true, true, true, false];
-  const roller = [false, true, true, true, true, false];
+  const pinned = [...PINNED_RESTRAINT];
+  const roller = [...ROLLER_X_RESTRAINT];
   const nodes = coordinates.map((x, index) => {
     const supportIndex = supportCoordinates.findIndex((supportX) => Math.abs(supportX - x) < 1e-9);
+    const topologyNode = topologyNodes.find((node) => Math.abs(node.x - x) < 1e-9);
     const node: Record<string, unknown> = { id: `${index + 1}`, x, y: 0, z: 0 };
-    if (supportIndex >= 0) {
+    if (topologyNode?.restraints) {
+      node.restraints = [...topologyNode.restraints];
+    } else if (supportIndex >= 0) {
       node.restraints = supportIndex === 0 ? pinned : roller;
     }
     return node;
@@ -982,6 +1340,109 @@ function getPortalFrameSpanLengths(state: DraftState): number[] {
   return Array.from({ length: bayCount }, () => span);
 }
 
+function buildPortalFrameMaterial(state: DraftState): { record: Record<string, unknown>; G: number } {
+  const grade = state.engineeringDraft?.material?.grade?.trim().toUpperCase();
+  const qGrade = grade?.match(/^Q(235|345|355|390|420)$/);
+  if (qGrade) {
+    const fy = Number(qGrade[1]);
+    return {
+      record: { id: '1', name: grade, grade, category: 'steel', E: 206000, nu: 0.3, rho: 7850, fy },
+      G: 79000,
+    };
+  }
+  const sGrade = grade?.match(/^S(235|275|355)$/);
+  if (sGrade) {
+    const fy = Number(sGrade[1]);
+    return {
+      record: { id: '1', name: grade, grade, category: 'steel', E: 210000, nu: 0.3, rho: 7850, fy },
+      G: 81000,
+    };
+  }
+  if (grade === 'A36') {
+    return {
+      record: { id: '1', name: grade, grade, category: 'steel', E: 200000, nu: 0.3, rho: 7850, fy: 248 },
+      G: 77000,
+    };
+  }
+  return {
+    record: { id: '1', name: 'steel', E: 205000, nu: 0.3, rho: 7850 },
+    G: 79000,
+  };
+}
+
+function buildPortalFrameSection(state: DraftState, G: number): Record<string, unknown> {
+  const raw = state.engineeringDraft?.sections?.member
+    ?? state.engineeringDraft?.sections?.beam
+    ?? state.engineeringDraft?.sections?.column;
+  const normalized = raw?.trim().toUpperCase().replace(/[×*]/g, 'X').replace(/\s+/g, '');
+  const match = normalized?.match(/^H(\d+(?:\.\d+)?)X(\d+(?:\.\d+)?)X(\d+(?:\.\d+)?)X(\d+(?:\.\d+)?)$/);
+  if (!match) {
+    return { id: '1', name: 'PF1', type: 'beam', properties: { A: 0.02, Iy: 0.0002, Iz: 0.0002, J: 0.0002, G } };
+  }
+
+  const H = Number(match[1]);
+  const B = Number(match[2]);
+  const tw = Number(match[3]);
+  const tf = Number(match[4]);
+  const hw = H - 2 * tf;
+  if (hw <= 0) {
+    return { id: '1', name: 'PF1', type: 'beam', properties: { A: 0.02, Iy: 0.0002, Iz: 0.0002, J: 0.0002, G } };
+  }
+
+  const A = (tw * hw + 2 * B * tf) / 1e6;
+  const Iy = ((tw * hw ** 3) / 12 + (2 * B * tf ** 3) / 12 + 2 * B * tf * ((hw + tf) / 2) ** 2) / 1e12;
+  const Iz = ((2 * tf * B ** 3) / 12 + (hw * tw ** 3) / 12) / 1e12;
+  const J = (2 * B * tf ** 3 + hw * tw ** 3) / 3 / 1e12;
+  return {
+    id: '1',
+    name: normalized,
+    type: 'H',
+    shape: { kind: 'H', H, B, tw, tf },
+    properties: { A, Iy, Iz, J, G },
+  };
+}
+
+function portalCraneTargetIndex(
+  load: EngineeringDraftLoad,
+  xCoordinates: number[],
+): number | undefined {
+  const explicitX = load.location?.xM;
+  if (explicitX !== undefined) {
+    const index = xCoordinates.findIndex((x) => coordinateMatches(x, explicitX));
+    if (index >= 0) return index;
+  }
+  const role = `${load.location?.nodeRole ?? ''} ${load.target ?? ''}`.trim().toLowerCase();
+  if (role.includes('right') || /右柱|右侧/u.test(role)) return xCoordinates.length - 1;
+  if (role.includes('left') || /左柱|左侧/u.test(role)) return 0;
+  if (role.includes('middle') || role.includes('center') || role.includes('centre') || /中柱|中间/u.test(role)) {
+    return Math.floor((xCoordinates.length - 1) / 2);
+  }
+  return undefined;
+}
+
+function buildPortalCraneLoads(state: DraftState, xCoordinates: number[]): Array<Record<string, unknown>> {
+  const loads: Array<Record<string, unknown>> = [];
+  for (const load of state.engineeringDraft?.loads ?? []) {
+    if (load.kind !== 'point' && load.kind !== 'nodal') continue;
+    const targetIndex = portalCraneTargetIndex(load, xCoordinates);
+    if (targetIndex === undefined) continue;
+    const target = `T${targetIndex}`;
+    if (load.direction === 'globalX') {
+      loads.push({ node: target, fx: load.magnitude });
+    } else if (load.direction === 'globalY') {
+      loads.push({ node: target, fy: load.magnitude });
+    } else {
+      loads.push({ node: target, fz: -Math.abs(load.magnitude) });
+    }
+  }
+  if (loads.length > 0) return loads;
+
+  const legacyCraneLoad = readPositiveNumber(state.skillState?.craneLoadKN);
+  if (legacyCraneLoad === undefined) return [];
+  const target = xCoordinates.length > 2 ? 'T1' : 'T0';
+  return [{ node: target, fz: -legacyCraneLoad }];
+}
+
 function buildPortalFrameModel(state: DraftState, metadata: Record<string, unknown>): Record<string, unknown> {
   const spans = getPortalFrameSpanLengths(state);
   const xCoordinates = accumulateCoordinates(spans);
@@ -989,11 +1450,17 @@ function buildPortalFrameModel(state: DraftState, metadata: Record<string, unkno
   const roofLoad = readPositiveNumber(state.skillState?.roofLoadKNM)
     ?? ((state.loadType === 'distributed' || state.loadPosition === 'full-span') ? state.loadKN : undefined);
   const nodalLoad = roofLoad === undefined ? state.loadKN! : undefined;
-  const craneLoad = readPositiveNumber(state.skillState?.craneLoadKN);
   const mezzanineHeight = readPositiveNumber(state.skillState?.mezzanineHeightM);
+  const mezzanineLength = readPositiveNumber(state.skillState?.mezzanineLengthM);
   const mezzanineLoad = readPositiveNumber(state.skillState?.mezzanineLoadKN);
-  const hasMezzanine = mezzanineHeight !== undefined && mezzanineHeight > 0 && mezzanineHeight < height && spans.length >= 1;
+  const hasMezzanine = mezzanineHeight !== undefined
+    && mezzanineHeight < height
+    && mezzanineLength !== undefined
+    && mezzanineLength <= spans[0]
+    && spans.length >= 1;
   const baseRestraint = buildFixedRestraint(state.frameBaseSupportType || 'fixed');
+  const material = buildPortalFrameMaterial(state);
+  const section = buildPortalFrameSection(state, material.G);
   const nodes: Array<Record<string, unknown>> = [];
   const elements: Array<Record<string, unknown>> = [];
   const loads: Array<Record<string, unknown>> = [];
@@ -1004,15 +1471,15 @@ function buildPortalFrameModel(state: DraftState, metadata: Record<string, unkno
   }
   if (hasMezzanine) {
     nodes.push({ id: 'M0', x: 0, y: 0, z: mezzanineHeight });
-    nodes.push({ id: 'M1', x: Math.min(spans[0] / 3, spans[0]), y: 0, z: mezzanineHeight });
+    nodes.push({ id: 'M1', x: mezzanineLength, y: 0, z: mezzanineHeight });
   }
 
   for (let i = 0; i < xCoordinates.length; i += 1) {
     if (hasMezzanine && i === 0) {
-      elements.push({ id: `C${i}a`, type: 'beam', nodes: [`B${i}`, 'M0'], material: '1', section: '1' });
-      elements.push({ id: `C${i}b`, type: 'beam', nodes: ['M0', `T${i}`], material: '1', section: '1' });
+      elements.push({ id: `C${i}a`, type: 'column', nodes: [`B${i}`, 'M0'], material: '1', section: '1' });
+      elements.push({ id: `C${i}b`, type: 'column', nodes: ['M0', `T${i}`], material: '1', section: '1' });
     } else {
-      elements.push({ id: `C${i}`, type: 'beam', nodes: [`B${i}`, `T${i}`], material: '1', section: '1' });
+      elements.push({ id: `C${i}`, type: 'column', nodes: [`B${i}`, `T${i}`], material: '1', section: '1' });
     }
   }
   for (let i = 0; i < spans.length; i += 1) {
@@ -1035,22 +1502,15 @@ function buildPortalFrameModel(state: DraftState, metadata: Record<string, unkno
       loads.push({ type: 'nodal', node: `T${i}`, forces: [0, 0, perTopNode, 0, 0, 0] });
     }
   }
-  if (craneLoad !== undefined) {
-    const target = xCoordinates.length > 2 ? 'T1' : 'T0';
-    loads.push({ node: target, fz: -craneLoad });
-  }
+  loads.push(...buildPortalCraneLoads(state, xCoordinates));
 
   return {
     schema_version: '2.0.0',
     unit_system: 'SI',
     nodes,
     elements,
-    materials: [
-      { id: '1', name: 'steel', E: 205000, nu: 0.3, rho: 7850 },
-    ],
-    sections: [
-      { id: '1', name: 'PF1', type: 'beam', properties: { A: 0.02, Iy: 0.0002, Iz: 0.0002, J: 0.0002, G: 79000 } },
-    ],
+    materials: [material.record],
+    sections: [section],
     load_cases: [
       { id: 'LC1', type: 'other', loads },
     ],
@@ -1063,6 +1523,7 @@ function buildPortalFrameModel(state: DraftState, metadata: Record<string, unkno
         spanLengthsM: spans,
         heightM: height,
         mezzanineHeightM: hasMezzanine ? mezzanineHeight : undefined,
+        mezzanineLengthM: hasMezzanine ? mezzanineLength : undefined,
       },
     },
   };
@@ -1125,5 +1586,9 @@ function buildBaseModel(state: DraftState): Record<string, unknown> {
 }
 
 export function buildModel(state: DraftState): Record<string, unknown> {
-  return attachSeismicMemberEvidence(buildBaseModel(state), state);
+  const dimension = state.inferredType === 'frame' && state.frameDimension === '3d' ? '3d' : '2d';
+  return withCanonicalCoordinateContract(
+    attachSeismicMemberEvidence(buildBaseModel(state), state),
+    dimension,
+  );
 }

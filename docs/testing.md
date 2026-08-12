@@ -36,6 +36,23 @@ This document clarifies the current test system for issue #234 and is updated wh
 | `tests/llm-integration/**` | Legacy LLM integration harness and helper unit tests | `node tests/runner.mjs llm-integration` plus local helper tests |
 | `tests/llm-benchmark/**` | LangGraph agent benchmark scenarios and scoring (git submodule from [structureclaw-benchmark](https://github.com/structureclaw/structureclaw-benchmark)) | `node tests/runner.mjs llm-benchmark` |
 
+The public benchmark submodule contains the versioned corpus, frozen ground
+truth, runner, and scoring runtime required for reproducible evaluation.
+
+The OpenClaw external harness reuses that corpus and scorer:
+
+```bash
+node tests/runner.mjs openclaw-benchmark --dry-run
+node tests/runner.mjs openclaw-benchmark --scenario <id> --mode all
+```
+
+It pins OpenClaw to `2026.6.33` and Paratera `GLM-5.2` (experiment label
+`glm-5.2-paratera`) without model fallbacks. The
+default workload concurrency is 10, while OpenSees, PKPM, and YJK each retain
+an independent capacity-one solver lock; YJK also retains the 5-second
+post-run cooldown. Standard workflow scenarios run in `auto` and
+`generic-only`; interactive and multimodal scenarios run in `auto`.
+
 ## CI Workflow Boundaries
 
 | Workflow | Purpose | Notes |
@@ -46,6 +63,7 @@ This document clarifies the current test system for issue #234 and is updated wh
 | `.github/workflows/e2e.yml` | Playwright browser workflows | Triggered on `master`, manually, or by `/test-e2e` comments from allowed users. |
 | `.github/workflows/install-smoke.yml` | Native install/build compatibility smoke | Calls `node tests/runner.mjs smoke-native`; frontend and backend static checks live in their own regression workflows. |
 | `.github/workflows/llm-integration.yml` | Real LLM integration checks | Triggered on `master`, manually, or by `/test-llm` comments from allowed users. |
+| `.github/workflows/llm-benchmark.yml` | Trusted real-LLM benchmark checks | Uses the public benchmark runner and corpus. |
 | `.github/workflows/publish-npm.yml` | Release gate before publishing | Repeats selected checks to protect releases. It does not own new coverage. |
 
 ## Frontend Vitest Split

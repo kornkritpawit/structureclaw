@@ -121,22 +121,57 @@ export function parseCsv(text: string, maxRows: number): { headers: string[]; ro
 }
 
 /** Extract DXF entities as structural hints. */
+const DXF_LINE_PREVIEW_LIMIT = 500;
+const DXF_TEXT_PREVIEW_LIMIT = 200;
+
 export function parseDxf(text: string): {
-  lines: Array<{ x1: number; y1: number; x2: number; y2: number }>;
+  lines: Array<{ x1: number; y1: number; z1: number; x2: number; y2: number; z2: number; layer: string }>;
   texts: string[];
   entityCount: number;
+  lineEntityCount: number;
+  textEntityCount: number;
+  invalidLineCount: number;
+  insertionUnits: { code: number; name: string; metersPerUnit: number | null } | null;
 } {
+  const insertionUnitDefinitions: Record<number, { name: string; metersPerUnit: number | null }> = {
+    0: { name: 'unitless', metersPerUnit: null },
+    1: { name: 'inches', metersPerUnit: 0.0254 },
+    2: { name: 'feet', metersPerUnit: 0.3048 },
+    4: { name: 'millimeters', metersPerUnit: 0.001 },
+    5: { name: 'centimeters', metersPerUnit: 0.01 },
+    6: { name: 'meters', metersPerUnit: 1 },
+    7: { name: 'kilometers', metersPerUnit: 1000 },
+    10: { name: 'yards', metersPerUnit: 0.9144 },
+    14: { name: 'decimeters', metersPerUnit: 0.1 },
+    15: { name: 'decameters', metersPerUnit: 10 },
+    16: { name: 'hectometers', metersPerUnit: 100 },
+    21: { name: 'us-survey-feet', metersPerUnit: 1200 / 3937 },
+  };
   const result = {
-    lines: [] as Array<{ x1: number; y1: number; x2: number; y2: number }>,
+    lines: [] as Array<{ x1: number; y1: number; z1: number; x2: number; y2: number; z2: number; layer: string }>,
     texts: [] as string[],
     entityCount: 0,
+    lineEntityCount: 0,
+    textEntityCount: 0,
+    invalidLineCount: 0,
+    insertionUnits: null as { code: number; name: string; metersPerUnit: number | null } | null,
   };
 
   const dxfLines = text.split(/\r?\n/).map((l) => l.trim());
+  for (let pairIndex = 0; pairIndex + 3 < dxfLines.length; pairIndex += 2) {
+    if (dxfLines[pairIndex] !== '9' || dxfLines[pairIndex + 1] !== '$INSUNITS') continue;
+    if (dxfLines[pairIndex + 2] !== '70') continue;
+    const code = Number.parseInt(dxfLines[pairIndex + 3], 10);
+    if (!Number.isFinite(code)) continue;
+    const definition = insertionUnitDefinitions[code] || { name: `code-${code}`, metersPerUnit: null };
+    result.insertionUnits = { code, ...definition };
+    break;
+  }
   let i = 0;
   while (i < dxfLines.length) {
     if (dxfLines[i] === '0' && dxfLines[i + 1] === 'LINE') {
       result.entityCount += 1;
+      result.lineEntityCount += 1;
       // Read next group codes until next entity
       const entity: Record<string, string> = {};
       i += 2;
@@ -146,24 +181,34 @@ export function parseDxf(text: string): {
         entity[code] = value;
         i += 2;
       }
-      if (result.lines.length < 200) {
-        result.lines.push({
-          x1: parseFloat(entity['10'] || '0'),
-          y1: parseFloat(entity['20'] || '0'),
-          x2: parseFloat(entity['11'] || '0'),
-          y2: parseFloat(entity['21'] || '0'),
-        });
+      const requiredCoordinates = ['10', '20', '11', '21'].map((code) => {
+        const raw = entity[code];
+        return raw !== undefined && raw.trim() !== '' ? Number(raw) : Number.NaN;
+      });
+      const optionalZCoordinates = ['30', '31'].map((code) => (
+        entity[code] === undefined
+          ? 0
+          : entity[code].trim() !== '' ? Number(entity[code]) : Number.NaN
+      ));
+      const coordinates = [...requiredCoordinates, ...optionalZCoordinates];
+      if (requiredCoordinates.some((value) => !Number.isFinite(value))
+        || optionalZCoordinates.some((value) => !Number.isFinite(value))) {
+        result.invalidLineCount += 1;
+      } else if (result.lines.length < DXF_LINE_PREVIEW_LIMIT) {
+        const [x1, y1, x2, y2, z1, z2] = coordinates;
+        result.lines.push({ x1, y1, z1, x2, y2, z2, layer: entity['8'] || '0' });
       }
       continue;
     }
     if (dxfLines[i] === '0' && (dxfLines[i + 1] === 'TEXT' || dxfLines[i + 1] === 'MTEXT')) {
       result.entityCount += 1;
+      result.textEntityCount += 1;
       i += 2;
       while (i < dxfLines.length && !(dxfLines[i] === '0')) {
         const code = dxfLines[i];
         const value = dxfLines[i + 1] || '';
         // Group code 1 = text string
-        if ((code === '1' || code === '3') && value.trim() && result.texts.length < 100) {
+        if ((code === '1' || code === '3') && value.trim() && result.texts.length < DXF_TEXT_PREVIEW_LIMIT) {
           result.texts.push(value.trim());
         }
         i += 2;
@@ -354,10 +399,16 @@ export async function analyzeUploadedFile(
       ext,
       size,
       entityCount: dxfData.entityCount,
-      lineCount: dxfData.lines.length,
-      lines: dxfData.lines.slice(0, 50),
-      texts: dxfData.texts.slice(0, 50),
-      note: 'LINE entities are CAD geometry hints. TEXT/MTEXT contains dimensions and labels; use the user request and drawing labels to decide the structural type.',
+      lineCount: dxfData.lineEntityCount,
+      textCount: dxfData.textEntityCount,
+      invalidLineCount: dxfData.invalidLineCount,
+      lines: dxfData.lines,
+      texts: dxfData.texts,
+      linesTruncated: dxfData.lineEntityCount - dxfData.invalidLineCount > dxfData.lines.length,
+      textsTruncated: dxfData.textEntityCount > dxfData.texts.length,
+      coordinateFrame: 'source-dxf',
+      insertionUnits: dxfData.insertionUnits,
+      note: 'LINE coordinates remain in the source DXF frame. Do not treat source Y as StructureClaw global Y or Z until the drawing view is confirmed. Use declared insertionUnits when available; ask when units, plan/elevation/3D axis mapping, or truncated entities are ambiguous.',
     };
   }
 
@@ -381,7 +432,29 @@ export function createAnalyzeFileTool() {
       input: { filePath: string; maxRows?: number },
       config: LangGraphRunnableConfig,
     ) => {
-      const workspaceRoot = (config.configurable as Partial<AgentConfigurable>)?.workspaceRoot;
+      const configurable = config.configurable as Partial<AgentConfigurable>;
+      const workspaceRoot = configurable?.workspaceRoot;
+      if (Array.isArray(configurable?.fileAccessAllowlist)) {
+        let requestedPath: string;
+        let allowedPaths: string[];
+        try {
+          requestedPath = resolveUploadPath(input.filePath, workspaceRoot);
+          allowedPaths = configurable.fileAccessAllowlist.map(
+            (filePath) => resolveUploadPath(filePath, workspaceRoot),
+          );
+        } catch (error) {
+          return JSON.stringify({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        if (!allowedPaths.includes(requestedPath)) {
+          return JSON.stringify({
+            success: false,
+            error: 'Access denied: analyze_file is restricted to the attachments supplied for this run',
+          });
+        }
+      }
       return JSON.stringify(await analyzeUploadedFile(input.filePath, workspaceRoot, input.maxRows));
     },
     {

@@ -21,8 +21,12 @@ import {
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { AIMessage, HumanMessage, SystemMessage, ToolMessage, type BaseMessage } from '@langchain/core/messages';
 import type { BaseCheckpointSaver } from '@langchain/langgraph';
-import { createChatModel } from '../utils/llm.js';
-import { AgentStateAnnotation, type AgentState } from './state.js';
+import { createChatModel, getReasoningContentLength } from '../utils/llm.js';
+import {
+  AgentStateAnnotation,
+  type AgentState,
+  type AgentToolAccessPolicy,
+} from './state.js';
 import { createRegisteredTools, type AgentToolFactoryDeps, type AgentToolDefinition } from './tool-registry.js';
 import { loadUserTools } from './user-tool-loader.js';
 import { getWorkspaceToolRoot } from './config.js';
@@ -37,6 +41,32 @@ import { repairToolMessageProtocol } from './message-protocol.js';
 
 function getAgentLogger(config: LangGraphRunnableConfig) {
   return getLogger(config.configurable as Partial<AgentConfigurable> | undefined);
+}
+
+export function applySessionToolAccessPolicy(
+  configurable: Partial<AgentConfigurable>,
+  policy: AgentToolAccessPolicy | undefined,
+): void {
+  if (Array.isArray(policy?.enabledToolIds)) {
+    configurable.enabledToolIds = [...policy.enabledToolIds];
+  }
+  if (Array.isArray(policy?.disabledToolIds)) {
+    configurable.disabledToolIds = [...policy.disabledToolIds];
+  }
+  if (Array.isArray(policy?.fileAccessAllowlist)) {
+    configurable.fileAccessAllowlist = [...policy.fileAccessAllowlist];
+  }
+}
+
+export function applyToolsNodeSessionContext(
+  configurable: Partial<AgentConfigurable> & Record<string, unknown>,
+  state: AgentState,
+): void {
+  configurable.agentState = state;
+  configurable.skillScope = state.selectedSkillIds?.length
+    ? state.selectedSkillIds
+    : undefined;
+  applySessionToolAccessPolicy(configurable, state.toolAccessPolicy);
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +230,9 @@ function createCallModelNode(
   ): Promise<Partial<AgentState>> {
     const log = getAgentLogger(config);
     const configurable = config.configurable as Partial<AgentConfigurable> | undefined;
+    if (configurable) {
+      applySessionToolAccessPolicy(configurable, state.toolAccessPolicy);
+    }
     // LangGraph's `messages` stream mode installs a callback handler that
     // prefers streaming. LangChain may then make `invoke()` return message
     // chunks; GLM-compatible streaming can yield empty/generic chunks after
@@ -336,6 +369,10 @@ function createCallModelNode(
     // receives the same config object) also sees agentState.
     const configurableAny = config.configurable as Record<string, unknown>;
     configurableAny.agentState = state;
+    applySessionToolAccessPolicy(
+      configurableAny as Partial<AgentConfigurable>,
+      state.toolAccessPolicy,
+    );
 
     // Remove base64 image data from ToolMessages before the main agent LLM.
     // Applied after turn-boundary computation so binary payload stripping
@@ -371,7 +408,17 @@ function createCallModelNode(
     const llmDuration = Date.now() - llmStart;
 
     const hasToolCalls = 'tool_calls' in response && Array.isArray((response as any).tool_calls) && (response as any).tool_calls.length > 0;
-    log.info({ node: 'agent', durationMs: llmDuration, hasToolCalls }, 'agent node LLM response received');
+    const responseMetadata = (response as { response_metadata?: Record<string, unknown> }).response_metadata;
+    const rawFinishReason = responseMetadata?.finish_reason ?? responseMetadata?.stop_reason;
+    const finishReason = typeof rawFinishReason === 'string' ? rawFinishReason : undefined;
+    log.info({
+      node: 'agent',
+      durationMs: llmDuration,
+      hasToolCalls,
+      finishReason,
+      contentLength: extractMessageText(response).length,
+      reasoningContentLength: getReasoningContentLength(response),
+    }, 'agent node LLM response received');
 
     if (shouldReplaceEmptyFinalResponse(response, currentTurnMessages)) {
       const toolNames = currentTurnMessages
@@ -457,15 +504,11 @@ export async function buildAgentGraph(deps: GraphDeps) {
   // done in callModel is invisible to the raw ToolNode.
   const toolsNode = async (state: AgentState, config: LangGraphRunnableConfig) => {
     const nodeLog = getAgentLogger(config);
-    const configurableAny = config.configurable as Record<string, unknown>;
-    configurableAny.agentState = state;
-    // Resolve skill scope once for all tools in this invocation
-    configurableAny.skillScope = state.selectedSkillIds?.length
-      ? state.selectedSkillIds
-      : undefined;
+    const configurableAny = config.configurable as Partial<AgentConfigurable> & Record<string, unknown>;
+    applyToolsNodeSessionContext(configurableAny, state);
     const activeTools = resolveActiveTools(
       tools,
-      config.configurable as Partial<AgentConfigurable> | undefined,
+      configurableAny,
     );
     nodeLog.debug({ node: 'tools', activeToolCount: activeTools.length }, 'tools node executing');
     const toolNode = new ToolNode(activeTools);

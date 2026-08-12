@@ -8,6 +8,52 @@ const unknownFallbackMatch = {
 };
 
 describe("draft extraction preservation", () => {
+  test("does not retry extraction against the same message when user correction is required", async () => {
+    const { shouldRetryDraftExtraction } = await import("../../../dist/agent-langgraph/tools.js");
+    const draftPatch = { lengthM: -5 };
+    const missing = { critical: ["lengthM"], optional: [] };
+
+    expect(shouldRetryDraftExtraction(draftPatch, missing, {
+      inferredType: "beam",
+      updatedAt: 0,
+      draftIssues: [{
+        field: "lengthM",
+        severity: "invalid",
+        reason: "Length must be positive.",
+      }],
+      skillState: { invalidDraftFields: ["lengthM"] },
+    })).toBe(false);
+    expect(shouldRetryDraftExtraction(draftPatch, missing, {
+      inferredType: "beam",
+      updatedAt: 0,
+    })).toBe(true);
+  });
+
+  test("reuses the structural type recorded by the preceding detection tool", async () => {
+    const { resolveDetectedStructuralTypeMatch } = await import("../../../dist/agent-langgraph/tools.js");
+    const plugin = {
+      id: "frame",
+      structureType: "frame",
+      manifest: { structuralTypeKeys: ["frame", "steel-frame"] },
+    };
+    const runtime = {
+      resolvePluginForType: async (key) => key === "steel-frame" ? plugin : null,
+    };
+
+    await expect(resolveDetectedStructuralTypeMatch(
+      runtime,
+      "steel-frame",
+      ["steel-frame"],
+    )).resolves.toEqual({
+      key: "steel-frame",
+      mappedType: "frame",
+      skillId: "frame",
+      supportLevel: "supported",
+      routingSource: "current-state",
+    });
+    await expect(resolveDetectedStructuralTypeMatch(runtime, null)).resolves.toBeNull();
+  });
+
   test("prefers explicit tool messages and falls back to graph user messages", async () => {
     const { resolveToolInputMessage } = await import("../../../dist/agent-langgraph/tools.js");
 
@@ -217,9 +263,9 @@ describe("draft extraction preservation", () => {
         computeMissing() {
           return { critical: ["loadKN"], optional: ["sectionSize"] };
         },
-        buildQuestions(criticalMissing, optionalMissing) {
+        buildQuestions(keys, criticalMissing) {
+          expect(keys).toEqual(["loadKN", "sectionSize"]);
           expect(criticalMissing).toEqual(["loadKN"]);
-          expect(optionalMissing).toEqual(["sectionSize"]);
           return [{
             paramKey: "loadKN",
             label: "Load",

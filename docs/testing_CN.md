@@ -36,6 +36,22 @@
 | `tests/llm-integration/**` | 旧 LLM integration harness 与 helper unit test | `node tests/runner.mjs llm-integration` 加本地 helper 测试 |
 | `tests/llm-benchmark/**` | LangGraph agent benchmark 场景与评分（git submodule，源仓库 [structureclaw-benchmark](https://github.com/structureclaw/structureclaw-benchmark)） | `node tests/runner.mjs llm-benchmark` |
 
+公共 benchmark 子模块包含可复现评测所需的版本化评测集、冻结真值、运行器
+和评分运行时。
+
+OpenClaw 外部 harness 复用同一套评测集与评分器：
+
+```bash
+node tests/runner.mjs openclaw-benchmark --dry-run
+node tests/runner.mjs openclaw-benchmark --scenario <id> --mode all
+```
+
+该入口将 OpenClaw 固定为 `2026.6.33`、模型固定为 Paratera `GLM-5.2`
+（实验标签 `glm-5.2-paratera`），并禁用模型 fallback。默认任务并发数为 10；
+OpenSees、PKPM、YJK 仍分别使用容量为 1 的
+独立求解器锁，YJK 还保留运行后 5 秒冷却。标准工作流场景运行 `auto` 和
+`generic-only`，交互与多模态场景只运行 `auto`。
+
 ## CI Workflow 边界
 
 | Workflow | 用途 | 说明 |
@@ -46,6 +62,7 @@
 | `.github/workflows/e2e.yml` | Playwright 浏览器流程 | 在 `master`、手动触发，或允许用户评论 `/test-e2e` 时运行。 |
 | `.github/workflows/install-smoke.yml` | Native install/build 兼容性 smoke | 调用 `node tests/runner.mjs smoke-native`；frontend 和 backend 静态检查由各自 regression workflow 负责。 |
 | `.github/workflows/llm-integration.yml` | 真实 LLM integration 检查 | 在 `master`、手动触发，或允许用户评论 `/test-llm` 时运行。 |
+| `.github/workflows/llm-benchmark.yml` | 可信触发的真实 LLM benchmark | 使用公共 benchmark 运行器与评测集。 |
 | `.github/workflows/publish-npm.yml` | 发布前 gate | 为保护发布重复运行部分检查。它不拥有新增测试覆盖。 |
 
 ## Frontend Vitest 拆分

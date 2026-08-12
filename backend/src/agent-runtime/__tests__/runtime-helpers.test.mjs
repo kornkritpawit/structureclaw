@@ -11,6 +11,72 @@ import { buildElementReferenceVectors } from '../../../dist/agent-runtime/refere
 import { skillExecutionSchema } from '../../../dist/agent-runtime/schema.js';
 
 describe('agent runtime helper utilities', () => {
+  test('loads structural handlers from the active backend build', async () => {
+    const { AgentSkillRuntime } = await import('../../../dist/agent-runtime/index.js');
+    const runtime = new AgentSkillRuntime();
+    const cases = [
+      {
+        skillId: 'beam',
+        dimension: '2d',
+        state: {
+          inferredType: 'beam',
+          skillId: 'beam',
+          lengthM: 3,
+          supportType: 'cantilever',
+          loadKN: 10,
+          loadType: 'point',
+          loadPosition: 'midspan',
+        },
+      },
+      {
+        skillId: 'frame',
+        dimension: '3d',
+        state: {
+          inferredType: 'frame',
+          skillId: 'frame',
+          frameDimension: '3d',
+          storyCount: 1,
+          bayCountX: 1,
+          bayCountY: 1,
+          storyHeightsM: [3],
+          bayWidthsXM: [6],
+          bayWidthsYM: [5],
+          floorLoads: [{ story: 1, verticalKN: 10 }],
+          frameBaseSupportType: 'fixed',
+        },
+      },
+      {
+        skillId: 'concrete-frame',
+        dimension: '2d',
+        state: {
+          inferredType: 'concrete-frame',
+          skillId: 'concrete-frame',
+          frameDimension: '2d',
+          storyCount: 2,
+          bayCount: 1,
+          storyHeightsM: [3, 3],
+          bayWidthsM: [6],
+          floorLoads: [
+            { story: 1, verticalKN: 10 },
+            { story: 2, verticalKN: 10 },
+          ],
+          frameBaseSupportType: 'fixed',
+        },
+      },
+    ];
+
+    for (const fixture of cases) {
+      const model = await runtime.buildModel(fixture.state, [fixture.skillId]);
+      expect(model?.coordinate_system).toEqual({
+        semantics: 'global-z-up',
+        version: 1,
+        dimension: fixture.dimension,
+        plane: fixture.dimension === '2d' ? 'xz' : null,
+        dof_order: ['ux', 'uy', 'uz', 'rx', 'ry', 'rz'],
+      });
+    }
+  });
+
   test('resolves structure type key aliases to the owning skill plugin', async () => {
     const { AgentSkillRuntime } = await import('../../../dist/agent-runtime/index.js');
     const runtime = new AgentSkillRuntime();
@@ -276,6 +342,77 @@ describe('agent runtime helper utilities', () => {
       routingSource: 'explicit-keyword',
     });
   });
+
+  test('benchmark LLM-only mode rejects unusable router output instead of using rule hints', async () => {
+    const previous = process.env.SCLAW_BENCHMARK_LLM_ONLY;
+    process.env.SCLAW_BENCHMARK_LLM_ONLY = '1';
+    try {
+      const { AgentSkillRuntime } = await import('../../../dist/agent-runtime/index.js');
+      const runtime = new AgentSkillRuntime();
+      await expect(runtime.detectStructuralTypeWithLlm(
+        {
+          invoke: async () => ({
+            content: 'not-json',
+            response_metadata: { finish_reason: 'length' },
+            additional_kwargs: { reasoning_content: 'reasoning only' },
+          }),
+        },
+        'A two-story steel frame',
+        'en',
+      )).rejects.toThrow(
+        'finishReason=length; contentLength=8; reasoningContentLength=14',
+      );
+    } finally {
+      if (previous === undefined) delete process.env.SCLAW_BENCHMARK_LLM_ONLY;
+      else process.env.SCLAW_BENCHMARK_LLM_ONLY = previous;
+    }
+  });
+
+  test('benchmark LLM-only mode routes unsupported structures through the LLM instead of keyword shortcuts', async () => {
+    const previous = process.env.SCLAW_BENCHMARK_LLM_ONLY;
+    process.env.SCLAW_BENCHMARK_LLM_ONLY = '1';
+    let invocations = 0;
+    let routerPrompt = '';
+    try {
+      const { AgentSkillRuntime } = await import('../../../dist/agent-runtime/index.js');
+      const runtime = new AgentSkillRuntime();
+      const match = await runtime.detectStructuralTypeWithLlm(
+        {
+          invoke: async (prompt) => {
+            invocations += 1;
+            routerPrompt = String(prompt);
+            return {
+              content: JSON.stringify({
+                action: 'unsupported',
+                structuralTypeKey: 'bridge',
+                mappedType: 'unknown',
+                supportLevel: 'unsupported',
+                confidence: 0.98,
+                reason: 'Moving-load bridge workflows are outside the available skills.',
+              }),
+            };
+          },
+        },
+        'Build a three-span bridge model with moving vehicle loads.',
+        'en',
+      );
+
+      expect(invocations).toBe(1);
+      expect(routerPrompt).toContain('Rule hint:\nnull');
+      expect(routerPrompt).not.toContain('"routingSource": "explicit-keyword"');
+      expect(match).toMatchObject({
+        key: 'bridge',
+        mappedType: 'unknown',
+        supportLevel: 'unsupported',
+        routingSource: 'llm-suggested',
+      });
+      expect(match.skillId).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.SCLAW_BENCHMARK_LLM_ONLY;
+      else process.env.SCLAW_BENCHMARK_LLM_ONLY = previous;
+    }
+  });
+
 
   test('resets stale draft state when the LLM routes a stable draft to generic', async () => {
     const { AgentSkillRuntime } = await import('../../../dist/agent-runtime/index.js');
@@ -624,6 +761,153 @@ describe('agent runtime helper utilities', () => {
     expect(computeLegacyMissing(state, 'execution', ['spanLengthM', 'heightM', 'loadKN']).critical).toContain('loadKN');
   });
 
+  test('unresolved issues on defaultable fields block legacy execution and model building', async () => {
+    const {
+      buildLegacyModel,
+      computeLegacyMissing,
+      mergeLegacyState,
+      normalizeLegacyDraftPatch,
+    } = await import('../../../dist/agent-runtime/legacy.js');
+
+    const patch = normalizeLegacyDraftPatch({
+      inferredType: 'beam',
+      lengthM: 6,
+      supportType: 'simply-supported',
+      loadKN: 20,
+      draftIssues: [{
+        field: 'loadType',
+        severity: 'ambiguous',
+        reason: 'The value 20 could be a point load in kN or a line load in kN/m.',
+      }],
+    });
+    const state = mergeLegacyState(undefined, patch, 'beam', 'beam');
+    const allowedKeys = ['lengthM', 'supportType', 'loadKN', 'loadType', 'loadPosition'];
+
+    expect(computeLegacyMissing(state, 'execution', allowedKeys).critical).toContain('loadType');
+    expect(buildLegacyModel(state, allowedKeys)).toBeUndefined();
+  });
+
+  test('structured engineering-draft issue paths block legacy execution until corrected', async () => {
+    const {
+      buildLegacyModel,
+      computeLegacyMissing,
+      mergeLegacyState,
+      normalizeLegacyDraftPatch,
+    } = await import('../../../dist/agent-runtime/legacy.js');
+
+    const patch = normalizeLegacyDraftPatch({
+      inferredType: 'beam',
+      engineeringDraft: {
+        structureType: 'beam',
+        geometry: { lengthM: 100000 },
+        sections: { beam: '1mm' },
+        boundary: { supportType: 'simply-supported' },
+        loads: [{
+          kind: 'distributed',
+          magnitude: 999999999,
+          unit: 'kN/m',
+          direction: 'gravity',
+          target: 'beam',
+        }],
+      },
+      draftIssues: [
+        {
+          field: 'geometry.lengthM',
+          severity: 'unrealistic',
+          reason: 'The span requires confirmation.',
+          question: 'Please confirm the intended span.',
+        },
+        {
+          field: 'sections.beam',
+          severity: 'unrealistic',
+          reason: 'The section depth requires confirmation.',
+          question: 'Please provide the intended beam section.',
+        },
+        {
+          field: 'loads[0].magnitude',
+          severity: 'unrealistic',
+          reason: 'The load requires confirmation.',
+          question: 'Please confirm the intended load.',
+        },
+      ],
+    });
+    const state = mergeLegacyState(undefined, patch, 'beam', 'beam');
+    const allowedKeys = ['lengthM', 'supportType', 'loadKN', 'loadType', 'loadPosition'];
+
+    expect(computeLegacyMissing(state, 'execution', allowedKeys).critical).toEqual(expect.arrayContaining([
+      'geometry.lengthM',
+      'sections.beam',
+      'loads[0].magnitude',
+    ]));
+    expect(buildLegacyModel(state, allowedKeys)).toBeUndefined();
+
+    const correctedPatch = normalizeLegacyDraftPatch({
+      engineeringDraft: {
+        geometry: { lengthM: 6 },
+        sections: { beam: 'H400x200x8x13' },
+        loads: [{
+          kind: 'distributed',
+          magnitude: 20,
+          unit: 'kN/m',
+          direction: 'gravity',
+          target: 'beam',
+        }],
+      },
+    });
+    const correctedState = mergeLegacyState(state, correctedPatch, 'beam', 'beam');
+
+    expect(computeLegacyMissing(correctedState, 'execution', allowedKeys).critical).not.toEqual(expect.arrayContaining([
+      'geometry.lengthM',
+      'sections.beam',
+      'loads[0].magnitude',
+    ]));
+  });
+
+  test('structured issue questions retain the engineering reason and requested correction', async () => {
+    const { buildInteractionQuestions } = await import('../../../dist/agent-runtime/fallback.js');
+    const [question] = buildInteractionQuestions(
+      ['geometry.lengthM'],
+      ['geometry.lengthM'],
+      {
+        inferredType: 'beam',
+        updatedAt: 0,
+        draftIssues: [{
+          field: 'geometry.lengthM',
+          severity: 'unrealistic',
+          reason: 'The stated span is physically implausible.',
+          question: 'Please confirm the intended span.',
+        }],
+      },
+      'en',
+    );
+
+    expect(question).toEqual(expect.objectContaining({
+      paramKey: 'geometry.lengthM',
+      critical: true,
+      question: 'The stated span is physically implausible. Please confirm the intended span.',
+    }));
+    expect(question.suggestedValue).toBeUndefined();
+  });
+
+  test('runtime refuses model building whenever the selected skill reports critical missing input', async () => {
+    const { AgentSkillRuntime } = await import('../../../dist/agent-runtime/index.js');
+    const runtime = new AgentSkillRuntime();
+    runtime.getRegistry().resolvePluginForState = async () => ({
+      id: 'test-critical-guard',
+      handler: {
+        computeMissing: () => ({ critical: ['loadType'], optional: [] }),
+        buildModel: () => {
+          throw new Error('buildModel must not be called while critical input is unresolved');
+        },
+      },
+    });
+
+    await expect(runtime.buildModel({
+      inferredType: 'beam',
+      updatedAt: 0,
+    })).resolves.toBeUndefined();
+  });
+
   test('detectStructuralType keeps current portal-frame context for parameter updates', async () => {
     const { AgentSkillRuntime } = await import('../../../dist/agent-runtime/index.js');
     const runtime = new AgentSkillRuntime();
@@ -698,6 +982,28 @@ describe('agent runtime helper utilities', () => {
     expect(state.draftIssues ?? []).toEqual([]);
   });
 
+  test('valid support positions may start at the global origin', async () => {
+    const { mergeDraftState } = await import('../../../dist/agent-runtime/fallback.js');
+
+    const state = mergeDraftState({
+      inferredType: 'beam',
+      skillState: { invalidDraftFields: ['boundary.supportPositionsM'] },
+      draftIssues: [{
+        field: 'boundary.supportPositionsM',
+        severity: 'invalid',
+        reason: 'Support positions must be valid coordinates.',
+      }],
+      updatedAt: 0,
+    }, {
+      engineeringDraft: {
+        boundary: { supportPositionsM: [0, 6] },
+      },
+    });
+
+    expect(state.skillState?.invalidDraftFields ?? []).not.toContain('boundary.supportPositionsM');
+    expect(state.draftIssues ?? []).toEqual([]);
+  });
+
   test('merges engineering draft loads without duplicating repeated load definitions', async () => {
     const { mergeDraftState } = await import('../../../dist/agent-runtime/fallback.js');
 
@@ -722,6 +1028,167 @@ describe('agent runtime helper utilities', () => {
     expect(second.engineeringDraft?.loads).toEqual([
       { kind: 'line', magnitude: 12, unit: 'kN/m', direction: 'gravity', target: 'floor 1' },
       { kind: 'point', magnitude: 30, unit: 'kN', direction: 'globalX', target: 'roof' },
+    ]);
+  });
+
+  test('preserves distinct named load cases and explicit combinations', async () => {
+    const {
+      mergeEngineeringDraft,
+      normalizeEngineeringDraft,
+    } = await import('../../../dist/agent-runtime/engineering-draft.js');
+
+    const dead = normalizeEngineeringDraft({
+      structureType: 'steel-frame',
+      loads: [{
+        kind: 'line',
+        magnitude: 10,
+        unit: 'kN/m',
+        direction: 'gravity',
+        target: 'floor beam',
+        loadCaseId: 'D',
+        loadCaseType: 'dead',
+      }],
+    });
+    const live = normalizeEngineeringDraft({
+      loads: [{
+        kind: 'line',
+        magnitude: 8,
+        unit: 'kN/m',
+        direction: 'gravity',
+        target: 'floor beam',
+        caseId: 'L',
+        caseType: 'live',
+      }],
+      analysis: {
+        type: 'static',
+        loadCombinations: [{ id: 'ULS', factors: { D: 1.2, L: 1.4 } }],
+      },
+    });
+    const merged = mergeEngineeringDraft(dead, live);
+
+    expect(merged?.loads).toEqual([
+      expect.objectContaining({ magnitude: 10, caseId: 'D', caseType: 'dead' }),
+      expect.objectContaining({ magnitude: 8, caseId: 'L', caseType: 'live' }),
+    ]);
+    expect(merged?.analysis?.loadCombinations).toEqual([
+      { id: 'ULS', factors: { D: 1.2, L: 1.4 } },
+    ]);
+  });
+
+  test('deduplicates equivalent load aliases emitted in one engineering draft', async () => {
+    const { mergeEngineeringDraft } = await import('../../../dist/agent-runtime/engineering-draft.js');
+
+    const merged = mergeEngineeringDraft(undefined, {
+      structureType: 'steel-frame',
+      geometry: { storyHeightsM: [12], bayWidthsM: [24] },
+      loads: [
+        {
+          kind: 'line',
+          magnitude: 36,
+          unit: 'kN/m',
+          direction: 'gravity',
+          target: 'roof beam',
+          location: { story: 1 },
+          caseId: 'D',
+        },
+        {
+          kind: 'distributed',
+          magnitude: 36,
+          unit: 'kN/m',
+          direction: 'gravity',
+          target: 'story 1 beam',
+          location: { story: 1 },
+          caseId: 'D',
+        },
+        {
+          kind: 'point',
+          magnitude: 98,
+          unit: 'kN',
+          direction: 'gravity',
+          target: 'right column top',
+          location: { story: 1, nodeRole: 'right-side' },
+          caseId: 'C',
+        },
+        {
+          kind: 'nodal',
+          magnitude: 98,
+          unit: 'kN',
+          direction: 'gravity',
+          target: 'right roof joint',
+          location: { story: 1, nodeRole: 'right-side' },
+          caseId: 'C',
+        },
+      ],
+      analysis: {
+        loadCombinations: [{ id: 'ULS', factors: { D: 1, C: 1 } }],
+      },
+    });
+
+    expect(merged?.loads).toEqual([
+      expect.objectContaining({ kind: 'distributed', magnitude: 36, caseId: 'D' }),
+      expect.objectContaining({ kind: 'nodal', magnitude: 98, caseId: 'C' }),
+    ]);
+  });
+
+  test('treats span 1 and omitted locations as the same full-span load for a single-span beam', async () => {
+    const { mergeDraftState } = await import('../../../dist/agent-runtime/fallback.js');
+
+    const first = mergeDraftState(undefined, {
+      engineeringDraft: {
+        structureType: 'beam',
+        geometry: { lengthM: 6 },
+        loads: [
+          {
+            kind: 'distributed',
+            magnitude: 20,
+            unit: 'kN/m',
+            direction: 'gravity',
+            target: 'beam',
+            location: { spanIndex: 1 },
+          },
+        ],
+      },
+    });
+    const second = mergeDraftState(first, {
+      engineeringDraft: {
+        structureType: 'beam',
+        loads: [
+          {
+            kind: 'distributed',
+            magnitude: 20,
+            unit: 'kN/m',
+            direction: 'gravity',
+            target: 'beam',
+          },
+          {
+            kind: 'point',
+            magnitude: 30,
+            unit: 'kN',
+            direction: 'gravity',
+            target: 'beam',
+            location: { xM: 3, nodeRole: 'midspan' },
+          },
+        ],
+      },
+    });
+
+    expect(second.engineeringDraft?.loads).toEqual([
+      {
+        kind: 'distributed',
+        magnitude: 20,
+        unit: 'kN/m',
+        direction: 'gravity',
+        target: 'beam',
+        location: { spanIndex: 1 },
+      },
+      {
+        kind: 'point',
+        magnitude: 30,
+        unit: 'kN',
+        direction: 'gravity',
+        target: 'beam',
+        location: { xM: 3, nodeRole: 'midspan' },
+      },
     ]);
   });
 
@@ -769,6 +1236,86 @@ describe('agent runtime helper utilities', () => {
     expect(patch.floorLoads).toEqual([
       { story: 2, lateralXKN: 20 },
     ]);
+  });
+
+  test('prefers structured story locations when projecting frame floor loads', async () => {
+    const { projectEngineeringDraftToLegacyPatch } = await import('../../../dist/agent-runtime/engineering-draft.js');
+
+    const patch = projectEngineeringDraftToLegacyPatch({
+      engineeringDraft: {
+        structureType: 'concrete-frame',
+        geometry: {
+          storyHeightsM: [3.6, 3.6],
+          bayWidthsM: [6],
+        },
+        loads: [
+          {
+            kind: 'area',
+            magnitude: 8,
+            unit: 'kN/m2',
+            direction: 'gravity',
+            target: 'floor 1',
+            location: { story: 2 },
+          },
+          {
+            kind: 'area',
+            magnitude: 5,
+            unit: 'kN/m2',
+            direction: 'gravity',
+            location: { story: 1 },
+          },
+        ],
+      },
+    }, 'frame');
+
+    expect(patch.floorLoads).toEqual([
+      { story: 1, verticalKN: 180 },
+      { story: 2, verticalKN: 288 },
+    ]);
+  });
+
+  test('preserves explicitly located frame nodal loads instead of projecting them as floor totals', async () => {
+    const { projectEngineeringDraftToLegacyPatch } = await import('../../../dist/agent-runtime/engineering-draft.js');
+
+    const patch = projectEngineeringDraftToLegacyPatch({
+      engineeringDraft: {
+        structureType: 'steel-frame',
+        geometry: {
+          storyHeightsM: [3, 3, 3],
+          bayWidthsM: [6, 6],
+        },
+        loads: [
+          {
+            kind: 'nodal',
+            magnitude: 10,
+            unit: 'kN',
+            direction: 'globalX',
+            location: { story: 1, nodeRole: 'right-side' },
+          },
+          {
+            kind: 'nodal',
+            magnitude: 15,
+            unit: 'kN',
+            direction: 'globalX',
+            location: { story: 2, nodeRole: 'right-side' },
+          },
+          {
+            kind: 'nodal',
+            magnitude: 20,
+            unit: 'kN',
+            direction: 'globalX',
+            location: { story: 3, nodeRole: 'right-side' },
+          },
+        ],
+      },
+    }, 'frame');
+
+    expect(patch.engineeringDraft?.loads?.map((load) => load.location)).toEqual([
+      { story: 1, nodeRole: 'right-side' },
+      { story: 2, nodeRole: 'right-side' },
+      { story: 3, nodeRole: 'right-side' },
+    ]);
+    expect(patch.floorLoads).toBeUndefined();
   });
 
   test('treats x-only engineering frame spans as 2d geometry', async () => {

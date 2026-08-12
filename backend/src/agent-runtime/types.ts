@@ -11,16 +11,36 @@ export type MaterialFamily = 'steel' | 'concrete' | 'composite' | 'timber' | 'ma
 export type EngineeringDraftLoadKind = 'point' | 'line' | 'area' | 'nodal' | 'distributed';
 export type EngineeringDraftLoadUnit = 'kN' | 'kN/m' | 'kN/m2';
 export type EngineeringDraftLoadDirection = 'gravity' | 'globalX' | 'globalY' | 'globalZ';
+export type EngineeringDraftLoadCaseType = 'dead' | 'live' | 'wind' | 'seismic' | 'other';
 
 export interface EngineeringDraftGeometry {
   lengthM?: number;
   heightM?: number;
   mezzanineHeightM?: number;
+  mezzanineLengthM?: number;
   spanLengthsM?: number[];
   storyHeightsM?: number[];
   bayWidthsM?: number[];
   bayWidthsXM?: number[];
   bayWidthsYM?: number[];
+}
+
+export interface EngineeringDraftTopologyNode {
+  id: string;
+  x: number;
+  y: number;
+  z: number;
+  restraints?: boolean[];
+}
+
+export interface EngineeringDraftTopologyMember {
+  id?: string;
+  nodes: [string, string];
+}
+
+export interface EngineeringDraftTopology {
+  nodes?: EngineeringDraftTopologyNode[];
+  members?: EngineeringDraftTopologyMember[];
 }
 
 export interface EngineeringDraftMaterial {
@@ -44,6 +64,7 @@ export interface EngineeringDraftBoundary {
 export interface EngineeringDraftLoadLocation {
   xM?: number;
   spanIndex?: number;
+  story?: number;
   nodeRole?: string;
 }
 
@@ -54,16 +75,25 @@ export interface EngineeringDraftLoad {
   direction?: EngineeringDraftLoadDirection;
   target?: string;
   location?: EngineeringDraftLoadLocation;
+  caseId?: string;
+  caseType?: EngineeringDraftLoadCaseType;
+}
+
+export interface EngineeringDraftLoadCombination {
+  id: string;
+  factors: Record<string, number>;
 }
 
 export interface EngineeringDraftAnalysis {
   type?: AgentAnalysisType;
   engineTarget?: 'opensees' | 'pkpm' | 'yjk';
+  loadCombinations?: EngineeringDraftLoadCombination[];
 }
 
 export interface EngineeringDraft {
   structureType?: StructuralTypeKey;
   geometry?: EngineeringDraftGeometry;
+  topology?: EngineeringDraftTopology;
   material?: EngineeringDraftMaterial;
   sections?: EngineeringDraftSections;
   boundary?: EngineeringDraftBoundary;
@@ -373,6 +403,7 @@ export interface SkillReportNarrativeInput {
   clauseTraceability: Array<Record<string, unknown>>;
   controllingCases: Record<string, unknown>;
   visualizationHints: VisualizationHints;
+  normalizedModel?: unknown;
   analysis?: unknown;
   codeCheck?: unknown;
   locale: AppLocale;

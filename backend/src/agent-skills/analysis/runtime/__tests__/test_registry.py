@@ -15,13 +15,26 @@ sys.path.insert(0, str(RUNTIME_DIR))
 sys.path.insert(0, str(BACKEND_SRC_DIR / "skill-shared" / "python"))
 
 from registry import AnalysisEngineRegistry  # noqa: E402
+from api import AnalysisRequest, _exception_error_code  # noqa: E402
+from contracts import AnalysisCapabilityError  # noqa: E402
 from structure_protocol.structure_model_v2 import StructureModelV2  # noqa: E402
+
+
+def _coordinate_system(dimension: str = "2d") -> dict:
+    return {
+        "semantics": "global-z-up",
+        "version": 1,
+        "dimension": dimension,
+        "plane": "xz" if dimension == "2d" else None,
+        "dof_order": ["ux", "uy", "uz", "rx", "ry", "rz"],
+    }
 
 
 def build_frame_model() -> StructureModelV2:
     return StructureModelV2.model_validate({
         "schema_version": "2.0.0",
         "unit_system": "SI",
+        "coordinate_system": _coordinate_system(),
         "nodes": [
             {"id": "B1", "x": 0.0, "y": 0.0, "z": 0.0, "restraints": [True, True, True, True, True, True]},
             {"id": "B2", "x": 6.0, "y": 0.0, "z": 0.0, "restraints": [True, True, True, True, True, True]},
@@ -87,6 +100,44 @@ class CapturingRegistry(AnalysisEngineRegistry):
 
 
 class AnalysisRegistryTest(unittest.TestCase):
+    def test_capability_error_has_a_stable_machine_readable_code(self) -> None:
+        error = AnalysisCapabilityError(
+            engine="yjk",
+            capability="canonical-3d-building-model",
+            reason="YJK requires a genuine 3-D model",
+        )
+
+        self.assertEqual(_exception_error_code(error), "ENGINE_INPUT_UNSUPPORTED")
+        self.assertEqual(error.meta["failureKind"], "capability-boundary")
+        self.assertEqual(error.meta["capability"], "canonical-3d-building-model")
+        self.assertEqual(_exception_error_code(RuntimeError("solver crashed")), "ANALYSIS_EXECUTION_FAILED")
+
+    def test_worker_request_migrates_v1_before_requiring_the_v2_coordinate_contract(self) -> None:
+        legacy_model = build_frame_model().model_dump(mode="json")
+        legacy_model["schema_version"] = "1.0.0"
+        legacy_model.pop("coordinate_system")
+        legacy_model["metadata"] = {}
+
+        request = AnalysisRequest.model_validate({
+            "type": "static",
+            "model": legacy_model,
+            "parameters": {},
+        })
+
+        self.assertEqual(request.model.coordinate_system.dimension, "2d")
+        self.assertEqual(request.model.coordinate_system.plane, "xz")
+
+    def test_worker_request_rejects_untyped_v2_instead_of_guessing(self) -> None:
+        untyped_model = build_frame_model().model_dump(mode="json")
+        untyped_model.pop("coordinate_system")
+
+        with self.assertRaisesRegex(ValueError, "typed coordinate_system"):
+            AnalysisRequest.model_validate({
+                "type": "static",
+                "model": untyped_model,
+                "parameters": {},
+            })
+
     def test_auto_seismic_analysis_routes_to_opensees_seismic_without_stripping_workflow(self) -> None:
         workflow = {
             "methodPreference": "response_spectrum",
