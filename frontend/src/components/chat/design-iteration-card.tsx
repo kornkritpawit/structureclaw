@@ -2,8 +2,9 @@
 
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { useState } from 'react'
+import { ToolCallCard } from './tool-call-card'
 import type { TimelineStepItem } from './message-presentation'
-import { useI18n, type MessageKey } from '@/lib/i18n'
+import type { MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 /**
@@ -49,6 +50,7 @@ export type DesignLoopStateView = {
 export type DesignIterationCardProps = {
   step: TimelineStepItem
   designState?: DesignLoopStateView | null
+  locale?: 'en' | 'zh'
   t: (key: MessageKey) => string
 }
 
@@ -123,24 +125,17 @@ function IterationChanges({
   )
 }
 
-export function DesignIterationCard({ step, designState, t }: DesignIterationCardProps) {
+export function DesignIterationCard({ step, designState, locale = 'zh', t }: DesignIterationCardProps) {
   const [expanded, setExpanded] = useState(false)
-  const { locale } = useI18n()
   const iterations = designState?.iterations ?? []
   const statusAction = designState?.lastAction
     ?? (iterations.length > 0 ? iterations[iterations.length - 1].action : undefined)
 
-  if (iterations.length === 0 && step.status === 'running') {
-    return (
-      <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 px-3 py-2 dark:border-cyan-400/20">
-        <span className="font-mono text-xs font-medium text-foreground">{step.tool}</span>
-        <span className="ml-2 text-[10px] uppercase tracking-wide text-cyan-600 dark:text-cyan-400">
-          {t('toolRunning')}
-        </span>
-      </div>
-    )
+  if (iterations.length === 0) {
+    // Design state not available (e.g. archived conversation without streamed
+    // state) — fall back to the generic tool card so the step stays visible.
+    return <ToolCallCard step={step} t={t} attached />
   }
-  if (iterations.length === 0) return null
 
   const lastIteration = iterations[iterations.length - 1]
   const lastSummary = normalizeSummary(lastIteration?.summary, locale)

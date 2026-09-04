@@ -5275,6 +5275,7 @@ export function AIConsole() {
                                     key={toolMessage.id}
                                     step={toolMessage.toolStep}
                                     designState={latestResult?.designState as DesignLoopStateView | undefined}
+                                    locale={locale}
                                     t={t}
                                   />
                                 ) : (
@@ -5313,6 +5314,7 @@ export function AIConsole() {
                               <DesignIterationCard
                                 step={message.toolStep}
                                 designState={latestResult?.designState as DesignLoopStateView | undefined}
+                                locale={locale}
                                 t={t}
                               />
                             ) : (
