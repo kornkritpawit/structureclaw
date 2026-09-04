@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "structureclaw-benchmark-compare/v1",
+  "notes": [
+    "Dual-target llm-benchmark comparison config (issue #304).",
+    "Targets are locally served OpenAI-compatible vLLM endpoints from the model-deploy stack folder outside this repo: GLM-5.3-Flash on GPUs 0-3 (host port 7999) and Qwen3.8-Flash-Next FP8 on GPUs 6-7 (host port 8002).",
+    "The judge is a fixed third model served single-GPU on the GPU free of both targets; its compose file lives in the model-deploy stack folder outside this repo. Start it before running.",
+    "apiKeyEnv names the environment variable holding each endpoint key. Key values are resolved from the environment at run time and are never written to committed files, logs, or comparison reports."
+  ],
+  "targets": [
+    {
+      "name": "glm-5.3-flash",
+      "label": "GLM-5.3-Flash (local vLLM, GPUs 0-3)",
+      "baseUrl": "http://127.0.0.1:7999/v1",
+      "model": "zai-org/GLM-5.3-Flash",
+      "apiKeyEnv": "SCLAW_BENCHMARK_VLLM_API_KEY"
+    },
+    {
+      "name": "qwen3.8-flash-next",
+      "label": "Qwen3.8-Flash-Next FP8 (local vLLM, GPUs 6-7)",
+      "baseUrl": "http://127.0.0.1:8002/v1",
+      "model": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "apiKeyEnv": "SCLAW_BENCHMARK_VLLM_API_KEY"
+    }
+  ],
+  "judge": {
+    "name": "judge",
+    "label": "Qwen3-30B-A3B-Instruct-2507 w4a16 (local vLLM, single judge GPU)",
+    "baseUrl": "http://127.0.0.1:8001/v1",
+    "model": "RedHatAI/Qwen3-30B-A3B-Instruct-2507-quantized.w4a16",
+    "apiKeyEnv": "SCLAW_BENCHMARK_JUDGE_API_KEY"
+  }
+}
