@@ -37,6 +37,11 @@ function envNumber(name: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function toPositiveInt(value: unknown): number | undefined {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : undefined;
+}
+
 function resolveAiStructureSettings(
   fileSettings: SettingsFileDesignAiStructure | undefined,
 ): AiStructureDesignSettings {
@@ -72,11 +77,11 @@ function resolveAiStructureSettings(
 /** Resolve the effective design-loop settings (settings.json → env → defaults). */
 export function resolveDesignSettings(): DesignSettings {
   const fileDesign = readSettingsFile()?.design;
-  const fileMaxIterations = fileDesign?.maxIterations
-    ?? envNumber('DESIGN_MAX_ITERATIONS')
+  const maxIterations = toPositiveInt(fileDesign?.maxIterations)
+    ?? toPositiveInt(envNumber('DESIGN_MAX_ITERATIONS'))
     ?? DESIGN_DEFAULT_MAX_ITERATIONS;
   return {
-    maxIterations: Math.max(1, Math.floor(fileMaxIterations)),
+    maxIterations,
     aiStructure: resolveAiStructureSettings(fileDesign?.aiStructure),
   };
 }

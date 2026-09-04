@@ -312,7 +312,9 @@ export async function proposeLocalRuleDesign(input: DesignProviderInput): Promis
     const controlling = sectionFailures[0];
     const scale = computeLinearScale(controlling.utilization, input.safetyMargin);
     const nextShape = shape.kind === 'H' ? upgradeHShape(shape, scale) : upgradeRectShape(shape, scale);
-    if (!dimensionChanged(shape, nextShape)) {
+    // A meaningful upgrade must grow the primary dimensions — at the size cap
+    // only tw/tf would change, which is not a reportable section change.
+    if (nextShape.H === shape.H && nextShape.B === shape.B) {
       notes.push(`Section ${sectionId} already at the size limit; no further upgrade possible.`);
       return section;
     }
