@@ -182,6 +182,9 @@ export async function runLlmBenchmarkCompare(args, deps = {}) {
     return;
   }
   const write = deps.write || ((line) => process.stdout.write(`${line}\n`));
+  // runTargetBenchmark calls deps.write unconditionally, so the defaulted
+  // writer must be threaded through; plain CLI execution passes deps = {}.
+  const effectiveDeps = { ...deps, write };
   const config = loadCompareConfig(options.config);
   const plan = resolvePlan({ options, config, env: process.env, rootDir: REPO_ROOT });
   const scenarioCount = countPlannedScenarios(plan);
@@ -196,13 +199,15 @@ export async function runLlmBenchmarkCompare(args, deps = {}) {
   await runPreflight(plan, {
     fetchImpl: deps.fetchImpl,
     env: process.env,
-    write: (line) => process.stdout.write(line),
+    // Preflight streams progress mid-line, so its default stays raw stdout;
+    // an injected writer must receive it instead of hardcoded stdout.
+    write: deps.write || ((line) => process.stdout.write(line)),
   });
 
   fs.mkdirSync(plan.outputDir, { recursive: true });
   const results = [];
   for (const target of plan.targets) {
-    const result = await runTargetBenchmark(plan, target, deps);
+    const result = await runTargetBenchmark(plan, target, effectiveDeps);
     results.push(result);
   }
 

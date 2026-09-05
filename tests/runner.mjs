@@ -26,10 +26,10 @@ function loadOpenClawBenchmarkRunner() {
 
 async function runLlmBenchmarkCompare(rawArgs) {
   // Developer-facing comparison harness; loaded lazily like the submodule runners.
-  const { runLlmBenchmarkCompare } = await import(
+  const { runLlmBenchmarkCompare: runOrchestrator } = await import(
     "./llm-benchmark-compare/lib/orchestrator.mjs"
   );
-  await runLlmBenchmarkCompare(rawArgs);
+  await runOrchestrator(rawArgs);
 }
 
 function parseCliOptions(args) {

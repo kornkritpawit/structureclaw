@@ -526,6 +526,11 @@ test("runLlmBenchmarkCompare runs both targets end to end and writes the compari
     "Bearer dummy-key-0",
     "Bearer dummy-key-1",
   ]);
+  // Pre-flight progress must stream through the injected writer, not hardcoded
+  // stdout, so test/CI wrappers can capture it.
+  assert.match(output, /Pre-flight: checking judge "judge" at /);
+  assert.match(output, /Pre-flight: checking target 1 of 2 "alpha" at /);
+  assert.match(output, /ok \(serves org\/judge-model\)/);
 
   // Targets run sequentially with per-target model-under-test env and a
   // shared judge env; the results directory exists before each spawn.
@@ -555,4 +560,70 @@ test("runLlmBenchmarkCompare runs both targets end to end and writes the compari
   assert.ok(fs.existsSync(path.join(outDir, "comparison.md")));
   assert.match(output, /Comparison written to .*comparison\.json/);
   assert.match(output, /Comparison written to .*comparison\.md/);
+});
+
+test("runLlmBenchmarkCompare survives deps without a writer and still produces artifacts", async (t) => {
+  try {
+    countPlannedScenarios({ selection: { scenarioId: null, taskFamily: null } });
+  } catch {
+    t.skip("llm-benchmark submodule is not initialized; run `git submodule update --init`");
+    return;
+  }
+
+  const configPath = writeTempFile(t, validConfigDocument());
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "compare-no-writer-"));
+  t.after(() => fs.rmSync(outDir, { recursive: true, force: true }));
+
+  const keyNames = ["TEST_COMPARE_KEY_A", "TEST_COMPARE_KEY_B", "TEST_COMPARE_KEY_JUDGE"];
+  for (const [index, name] of keyNames.entries()) process.env[name] = `dummy-key-${index}`;
+  t.after(() => {
+    for (const name of keyNames) delete process.env[name];
+  });
+
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: [{ id: "org/model-alpha" }, { id: "org/model-beta" }, { id: "org/judge-model" }],
+    }),
+  });
+  const results = [
+    minimalRunResult({ model: "org/model-alpha", endpoint: "http://127.0.0.1:7001/v1", judgeEndpoint: "http://127.0.0.1:7003/v1", scenarioId: SMOKE_SCENARIO_ID }),
+    minimalRunResult({ model: "org/model-beta", endpoint: "http://127.0.0.1:7002/v1", judgeEndpoint: "http://127.0.0.1:7003/v1", scenarioId: SMOKE_SCENARIO_ID }),
+  ];
+  const spawnImpl = (command, args) => {
+    const output = args[args.indexOf("--output") + 1];
+    fs.mkdirSync(path.dirname(output), { recursive: true });
+    fs.writeFileSync(output, `${JSON.stringify(results.shift())}\n`);
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit("close", 0, null));
+    return child;
+  };
+
+  // Regression: the orchestrator used to call deps.write unconditionally, so
+  // plain CLI execution (deps = {}) crashed with "deps.write is not a function".
+  const originalWrite = process.stdout.write;
+  let stdout = "";
+  process.stdout.write = (chunk) => {
+    stdout += typeof chunk === "string" ? chunk : String(chunk);
+    return true;
+  };
+  try {
+    await runLlmBenchmarkCompare(
+      ["--config", configPath, "--output-dir", outDir, "--scenario", SMOKE_SCENARIO_ID],
+      { fetchImpl, spawnImpl },
+    );
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+
+  // The comparison artifacts are still produced and the defaulted writer
+  // carried the plan, target banners, and pre-flight progress to stdout.
+  const comparison = JSON.parse(fs.readFileSync(path.join(outDir, "comparison.json"), "utf8"));
+  assert.equal(comparison.overall.a.total, 1);
+  assert.ok(fs.existsSync(path.join(outDir, "comparison.md")));
+  assert.match(stdout, /LLM benchmark comparison plan/);
+  assert.match(stdout, /Pre-flight: checking judge "judge" at /);
+  assert.match(stdout, /==> Benchmarking target "alpha"/);
+  assert.match(stdout, /Comparison written to .*comparison\.json/);
 });
