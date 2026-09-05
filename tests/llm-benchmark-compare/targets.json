@@ -24,9 +24,9 @@
   ],
   "judge": {
     "name": "judge",
-    "label": "Qwen3-30B-A3B-Instruct-2507 w4a16 (local vLLM, single judge GPU)",
+    "label": "Qwen3.6-35B-A3B-FP8 (local vLLM, single judge GPU)",
     "baseUrl": "http://127.0.0.1:8001/v1",
-    "model": "RedHatAI/Qwen3-30B-A3B-Instruct-2507-quantized.w4a16",
+    "model": "Qwen/Qwen3.6-35B-A3B-FP8",
     "apiKeyEnv": "SCLAW_BENCHMARK_JUDGE_API_KEY"
   }
 }
