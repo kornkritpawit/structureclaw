@@ -21,7 +21,7 @@ const FIXED_FINGERPRINTS = {
 
 const JUDGE_IDENTITY = {
   model: "judge-model-fixed",
-  endpoint: "http://127.0.0.1:8001/v1",
+  endpoint: "https://127.0.0.1:8443/v1",
 };
 
 function buildScenario(overrides = {}) {
@@ -476,7 +476,7 @@ test("renderComparisonMarkdown renders headline, breakdowns, diff, and fingerpri
   assert.match(markdown, /# LLM Benchmark Comparison: Model A vs Model B/);
   assert.match(markdown, /\| Model \| org\/model-a \| org\/model-b \|/);
   assert.match(markdown, /\| Vision model \| org\/model-a \| org\/model-b \|/);
-  assert.match(markdown, /Shared judge: `judge-model-fixed` at `http:\/\/127\.0\.0\.1:8001\/v1`/);
+  assert.match(markdown, /Shared judge: `judge-model-fixed` at `https:\/\/127\.0\.0\.1:8443\/v1`/);
   assert.match(markdown, /\| Pass rate \| 2\/5 \(40\.0%\) \| 3\/5 \(60\.0%\) \| model-b \(\+20\.0 pp\) \|/);
   assert.match(markdown, /\| Pass@1 \| 2\/5 \(40\.0%\) \| 3\/5 \(60\.0%\) \| model-b \(\+20\.0 pp\) \|/);
   assert.match(markdown, /\| Avg primary-model tokens \| 1,000 \| 1,500 \|/);
