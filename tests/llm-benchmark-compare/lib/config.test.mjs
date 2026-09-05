@@ -16,7 +16,7 @@ import {
   resolvePlan,
   SMOKE_SCENARIO_ID,
 } from "./config.mjs";
-import { buildTargetEnv, countPlannedScenarios, printPlan, runLlmBenchmarkCompare } from "./orchestrator.mjs";
+import { buildTargetEnv, countPlannedScenarios, printPlan, resolveAnalysisPythonBin, runLlmBenchmarkCompare } from "./orchestrator.mjs";
 
 const CONFIG_SCHEMA_VERSION = "structureclaw-benchmark-compare/v1";
 
@@ -377,6 +377,39 @@ test("buildTargetEnv isolates the model under test and pins the vision model to 
   assert.equal(env.LLM_JUDGE_API_KEY, "dummy-judge-key");
 });
 
+test("resolveAnalysisPythonBin uses SCLAW_BENCHMARK_PYTHON_BIN verbatim when set", () => {
+  assert.equal(
+    resolveAnalysisPythonBin({
+      env: { SCLAW_BENCHMARK_PYTHON_BIN: "/opt/bench-python/bin/python" },
+      homedir: "/home/does-not-exist",
+      platform: "linux",
+    }),
+    "/opt/bench-python/bin/python",
+  );
+});
+
+test("resolveAnalysisPythonBin falls back to the shared home venv interpreter", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "compare-home-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const posixPython = path.join(home, ".structureclaw", ".venv", "bin", "python");
+  fs.mkdirSync(path.dirname(posixPython), { recursive: true });
+  fs.writeFileSync(posixPython, "");
+
+  assert.equal(resolveAnalysisPythonBin({ env: {}, homedir: home, platform: "linux" }), posixPython);
+
+  const winPython = path.join(home, ".structureclaw", ".venv", "Scripts", "python.exe");
+  fs.mkdirSync(path.dirname(winPython), { recursive: true });
+  fs.writeFileSync(winPython, "");
+  assert.equal(resolveAnalysisPythonBin({ env: {}, homedir: home, platform: "win32" }), winPython);
+});
+
+test("resolveAnalysisPythonBin returns null with no env var and no home venv", () => {
+  const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), "compare-home-empty-"));
+  assert.equal(resolveAnalysisPythonBin({ env: {}, homedir: emptyHome, platform: "linux" }), null);
+  // A blank env value must not be written into settings.json.
+  assert.equal(resolveAnalysisPythonBin({ env: { SCLAW_BENCHMARK_PYTHON_BIN: "   " }, homedir: emptyHome, platform: "linux" }), null);
+});
+
 test("runLlmBenchmarkCompare --dry-run prints the resolved plan and executes nothing", async (t) => {
   try {
     countPlannedScenarios({ selection: { scenarioId: null, taskFamily: null } });
@@ -626,4 +659,128 @@ test("runLlmBenchmarkCompare survives deps without a writer and still produces a
   assert.match(stdout, /Pre-flight: checking judge "judge" at /);
   assert.match(stdout, /==> Benchmarking target "alpha"/);
   assert.match(stdout, /Comparison written to .*comparison\.json/);
+});
+
+// Shared harness for the analysis-python seeding tests: a fully stubbed
+// two-target compare run through the real orchestration seam, with a probe
+// that captures the workspace state each spawn sees.
+async function runStubbedCompare(t, { prepare, spawnProbe }) {
+  const configPath = writeTempFile(t, validConfigDocument());
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), "compare-python-bin-"));
+  t.after(() => fs.rmSync(outDir, { recursive: true, force: true }));
+
+  const keyNames = ["TEST_COMPARE_KEY_A", "TEST_COMPARE_KEY_B", "TEST_COMPARE_KEY_JUDGE"];
+  for (const [index, name] of keyNames.entries()) process.env[name] = `dummy-key-${index}`;
+  t.after(() => {
+    for (const name of keyNames) delete process.env[name];
+  });
+
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: [{ id: "org/model-alpha" }, { id: "org/model-beta" }, { id: "org/judge-model" }],
+    }),
+  });
+  const results = [
+    minimalRunResult({ model: "org/model-alpha", endpoint: "http://127.0.0.1:7001/v1", judgeEndpoint: "http://127.0.0.1:7003/v1", scenarioId: SMOKE_SCENARIO_ID }),
+    minimalRunResult({ model: "org/model-beta", endpoint: "http://127.0.0.1:7002/v1", judgeEndpoint: "http://127.0.0.1:7003/v1", scenarioId: SMOKE_SCENARIO_ID }),
+  ];
+  const spawnImpl = (command, args, options) => {
+    if (spawnProbe) spawnProbe(options.env.SCLAW_DATA_DIR);
+    const output = args[args.indexOf("--output") + 1];
+    fs.mkdirSync(path.dirname(output), { recursive: true });
+    fs.writeFileSync(output, `${JSON.stringify(results.shift())}\n`);
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit("close", 0, null));
+    return child;
+  };
+
+  if (prepare) prepare(outDir);
+  await runLlmBenchmarkCompare(
+    ["--config", configPath, "--output-dir", outDir, "--scenario", SMOKE_SCENARIO_ID],
+    { write: () => {}, fetchImpl, spawnImpl },
+  );
+  return outDir;
+}
+
+test("orchestration seeds each isolated workspace with an analysis-only settings.json", async (t) => {
+  try {
+    countPlannedScenarios({ selection: { scenarioId: null, taskFamily: null } });
+  } catch {
+    t.skip("llm-benchmark submodule is not initialized; run `git submodule update --init`");
+    return;
+  }
+
+  const pythonBin = "/opt/bench-python/bin/python";
+  process.env.SCLAW_BENCHMARK_PYTHON_BIN = pythonBin;
+  t.after(() => {
+    delete process.env.SCLAW_BENCHMARK_PYTHON_BIN;
+  });
+
+  const settingsAtSpawn = [];
+  const outDir = await runStubbedCompare(t, {
+    // A stale settings file carrying an LLM override must be wiped by the run:
+    // observing only the analysis key at spawn time proves the write happens
+    // after the wipe (the file is replaced, not merged).
+    prepare: (dir) => {
+      fs.mkdirSync(path.join(dir, "alpha", "runtime-data"), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, "alpha", "runtime-data", "settings.json"),
+        `${JSON.stringify({ llm: { model: "stale-override" } })}\n`,
+      );
+    },
+    spawnProbe: (dataDir) => {
+      settingsAtSpawn.push(JSON.parse(fs.readFileSync(path.join(dataDir, "settings.json"), "utf8")));
+    },
+  });
+
+  assert.deepEqual(settingsAtSpawn, [
+    { analysis: { pythonBin } },
+    { analysis: { pythonBin } },
+  ]);
+  for (const target of ["alpha", "beta"]) {
+    const seeded = JSON.parse(fs.readFileSync(path.join(outDir, target, "runtime-data", "settings.json"), "utf8"));
+    // Exactly one key path: analysis.pythonBin, and never any LLM config —
+    // per-target model isolation must keep flowing from the env vars.
+    assert.deepEqual(seeded, { analysis: { pythonBin } });
+    assert.deepEqual(Object.keys(seeded), ["analysis"]);
+    assert.deepEqual(Object.keys(seeded.analysis), ["pythonBin"]);
+  }
+});
+
+test("orchestration writes no settings.json when no analysis python resolves", async (t) => {
+  try {
+    countPlannedScenarios({ selection: { scenarioId: null, taskFamily: null } });
+  } catch {
+    t.skip("llm-benchmark submodule is not initialized; run `git submodule update --init`");
+    return;
+  }
+
+  const originalHome = process.env.HOME;
+  const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), "compare-empty-home-"));
+  t.after(() => fs.rmSync(emptyHome, { recursive: true, force: true }));
+  t.after(() => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    delete process.env.SCLAW_BENCHMARK_PYTHON_BIN;
+  });
+
+  let spawnCount = 0;
+  const outDir = await runStubbedCompare(t, {
+    prepare: () => {
+      delete process.env.SCLAW_BENCHMARK_PYTHON_BIN;
+      // os.homedir() honors $HOME on POSIX; an empty home has no shared venv.
+      process.env.HOME = emptyHome;
+    },
+    spawnProbe: () => {
+      spawnCount += 1;
+    },
+  });
+
+  assert.equal(spawnCount, 2);
+  for (const target of ["alpha", "beta"]) {
+    assert.equal(fs.existsSync(path.join(outDir, target, "runtime-data")), true);
+    assert.equal(fs.existsSync(path.join(outDir, target, "runtime-data", "settings.json")), false);
+  }
 });

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -103,6 +104,26 @@ export function buildTargetEnv(plan, target, { judgeApiKey, targetApiKey }) {
   };
 }
 
+// The backend resolves its analysis Python as `$SCLAW_DATA_DIR/.venv/bin/python`
+// and otherwise falls back to the system python3, which lacks the analysis
+// runtime dependencies (e.g. fastapi) — a failure mode observed live when a
+// compare target's isolated data dir replaced the shared workspace. Resolution:
+// SCLAW_BENCHMARK_PYTHON_BIN verbatim, else the shared home venv interpreter,
+// else null (write no settings file and preserve the previous behavior).
+export function resolveAnalysisPythonBin({
+  env = process.env,
+  homedir = os.homedir(),
+  platform = process.platform,
+} = {}) {
+  const fromEnv = env.SCLAW_BENCHMARK_PYTHON_BIN?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+  const venvLayout = platform === "win32" ? "Scripts/python.exe" : "bin/python";
+  const venvPython = path.join(homedir, ".structureclaw", ".venv", venvLayout);
+  return fs.existsSync(venvPython) ? venvPython : null;
+}
+
 function readResultsFile(resultsPath, targetName) {
   let parsed;
   try {
@@ -134,6 +155,15 @@ async function runTargetBenchmark(plan, target, deps) {
   // no mkdir, so the per-target directory must exist before the (potentially
   // hours-long) run completes, or the results would be lost at write time.
   fs.mkdirSync(path.dirname(target.resultsPath), { recursive: true });
+  // Written after the wipe so each run starts clean; analysis-only on purpose —
+  // per-target LLM isolation must keep flowing from the env vars in childEnv.
+  const analysisPythonBin = resolveAnalysisPythonBin();
+  if (analysisPythonBin) {
+    fs.writeFileSync(
+      path.join(target.runtimeDataDir, "settings.json"),
+      `${JSON.stringify({ analysis: { pythonBin: analysisPythonBin } }, null, 2)}\n`,
+    );
+  }
 
   const args = [
     RUNNER_SCRIPT,
@@ -259,10 +289,13 @@ Options:
 Environment (key values are resolved from the environment and never logged or
 committed): per-target API key env var and judge API key env var as declared in
 the config; LLM_BENCHMARK_PROVIDER_REQUEST_TIMEOUT_MS is passed through to the
-benchmark runner.
+benchmark runner. Optional SCLAW_BENCHMARK_PYTHON_BIN overrides the analysis
+python pinned into each target workspace's settings.json.
 
 Each target run gets an isolated SCLAW_DATA_DIR workspace with fresh settings,
 so a settings.json LLM override cannot redirect the model under test, and a
-dedicated SQLite DATABASE_URL, mirroring CI's benchmark database pattern.
+dedicated SQLite DATABASE_URL, mirroring CI's benchmark database pattern. The
+seeded settings.json is analysis-only (analysis.pythonBin); all LLM config
+comes from the environment.
 `);
 }
